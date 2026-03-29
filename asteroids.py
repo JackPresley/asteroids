@@ -253,7 +253,7 @@ class Bullet(MySprite):
     dy = speed *  ship._theta_dy - ship.d_theta * ship._theta_dx  + ship.dy
     radius = 5  # size of the bullet
     theta = ship._theta
-    image = pygame.Surface([ 2*radius, 2*radius], pygame.SRCALPHA, 32)
+    image = pygame.Surface([2*radius, 2*radius], pygame.SRCALPHA, 32).convert_alpha()
     image.fill((255,255,255,0))
     self.rect = image.get_rect()
     pygame.draw.circle(image, (0,0,0), (radius, radius), radius)
@@ -306,7 +306,7 @@ class BigRock(Rock):
     dx = slow * dx
     dy = slow * dy
 
-    image = pygame.Surface([2*radius, 2*radius], pygame.SRCALPHA, 32)
+    image = pygame.Surface([2*radius, 2*radius], pygame.SRCALPHA, 32).convert_alpha()
     image.fill((255,255,255,0))
     pygame.draw.polygon(image, GREY, [[91,80],[81,75],[80,96],[35,100],[40,92],[5,81],\
                                           [10,60],[8,45],[22,22],[25,34],[38,33],[27,15],[65,10],[95,50],[100,60]],5)
@@ -338,7 +338,7 @@ class MediumRock(Rock):
       dy = randint(-4,4)
     dx, dy = slow * dx, slow * dy
 
-    image = pygame.Surface([2*radius, 2*radius], pygame.SRCALPHA, 32)
+    image = pygame.Surface([2*radius, 2*radius], pygame.SRCALPHA, 32).convert_alpha()
     image.fill((255,255,255,0))
     pygame.draw.polygon(image, GREY, [[60,0],[60,60],[0,60],[0,0],[60,0]],8)
     if randint(0,1):
@@ -359,7 +359,7 @@ class SmallRock(Rock):
       dy = randint(-6,6)
     dx, dy = slow * dx, slow * dy
 
-    image = pygame.Surface([2*radius, 2*radius], pygame.SRCALPHA, 32)
+    image = pygame.Surface([2*radius, 2*radius], pygame.SRCALPHA, 32).convert_alpha()
     image.fill((255,255,255,0))
     pygame.draw.polygon(image, GREY, [[30,0],[30,30],[0,30],[0,0],[30,0]],8)
     if randint(0,1):
