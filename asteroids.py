@@ -303,6 +303,17 @@ class MySprite(pygame.sprite.Sprite):
 
 
 class Ship(MySprite):  # This class extends the MySprite class defined above
+    _images_cache = None
+
+    @classmethod
+    def _init_images(cls):
+        if cls._images_cache is None:
+            cls._images_cache = {}
+            cls._images_cache["off"] = pygame.image.load("spaceShip2.png").convert_alpha()
+            cls._images_cache["right"] = pygame.image.load("spaceShip2right.png").convert_alpha()
+            cls._images_cache["left"] = pygame.transform.flip(cls._images_cache["right"], True, False)
+            cls._images_cache["both"] = pygame.image.load("spaceShip2thrust.png").convert_alpha()
+
     def __init__(
         self,
         screen,
@@ -315,12 +326,8 @@ class Ship(MySprite):  # This class extends the MySprite class defined above
         accel=0.02,
     ):
         self.accel = accel
-        images = {}
-        images["off"] = pygame.image.load("spaceShip2.png")
-        images["right"] = pygame.image.load("spaceShip2right.png")
-        images["left"] = pygame.transform.flip(images["right"], True, False)
-        images["both"] = pygame.image.load("spaceShip2thrust.png")
-        super().__init__(screen, images, x, y, theta, dx, dy, d_theta)
+        Ship._init_images()
+        super().__init__(screen, Ship._images_cache, x, y, theta, dx, dy, d_theta)
 
     def update(self, thrust, left, right, dt=1):
         self.d_theta = 0
@@ -345,6 +352,20 @@ class Ship(MySprite):  # This class extends the MySprite class defined above
 
 
 class Bullet(MySprite):
+    _image_cache = None
+    RADIUS = 5
+
+    @classmethod
+    def _init_image(cls):
+        if cls._image_cache is None:
+            r = cls.RADIUS
+            image = pygame.Surface(
+                [2 * r, 2 * r], pygame.SRCALPHA, 32
+            ).convert_alpha()
+            image.fill((255, 255, 255, 0))
+            pygame.draw.circle(image, (0, 0, 0), (r, r), r)
+            cls._image_cache = image
+
     def __init__(self, screen, ship, bullets, speed=5, distance=6 * winHeight / 7):
         self.speed = speed  # distance travelled by the bullet per game loop
         self.distance = distance  # distance the bullet travels before disappearing
@@ -355,14 +376,10 @@ class Bullet(MySprite):
         y = ship.p.y
         dx = speed * ship._theta_dx + ship.d_theta * ship._theta_dy + ship.dx
         dy = speed * ship._theta_dy - ship.d_theta * ship._theta_dx + ship.dy
-        radius = 5  # size of the bullet
         theta = ship._theta
-        image = pygame.Surface(
-            [2 * radius, 2 * radius], pygame.SRCALPHA, 32
-        ).convert_alpha()
-        image.fill((255, 255, 255, 0))
+        Bullet._init_image()
+        image = Bullet._image_cache
         self.rect = image.get_rect()
-        pygame.draw.circle(image, (0, 0, 0), (radius, radius), radius)
         super().__init__(screen, {0: image}, x, y, theta, dx, dy, 0)
         bullets.add(self)
         self.distance_travelled = 0
@@ -678,7 +695,11 @@ class Fader:
 
     # stops game play
     def shipDestroyed(self, frozenSurf, dt=1):
-        font = pygame.font.SysFont("Arial", max(1, int(self.font_size)))
+        size = max(1, int(self.font_size))
+        key = ("Arial", size)
+        if key not in _font_cache:
+            _font_cache[key] = pygame.font.SysFont("Arial", size)
+        font = _font_cache[key]
         surf = font.render("SHIP DESTROYED!", True, BLUE)
         surfRect = surf.get_rect()
         surfRect.center = (winWidth / 2, 0.3 * winHeight)
