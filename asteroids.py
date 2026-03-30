@@ -28,7 +28,8 @@ HEIGHT = 700
 winWidth = WIDTH + 1
 winHeight = HEIGHT + 1
 
-FPS = 150
+FPS = 60
+REFERENCE_FPS = 150  # speeds were tuned at this rate; dt is normalized to it
 
 WHITE = (255, 255, 255)
 GREY = (80, 80, 80)
@@ -285,8 +286,8 @@ class MySprite(pygame.sprite.Sprite):
                     (0, 0, rot_x + rotRectWidth - winWidth, -rot_y),
                 )
 
-    def update_position(self):
-        self.p.set_coords(self.p.x + self.dx, self.p.y + self.dy)
+    def update_position(self, dt=1):
+        self.p.set_coords(self.p.x + self.dx * dt, self.p.y + self.dy * dt)
         if self.p.refl_x:
             self.dy = -self.dy
             self._theta = 180 - self._theta
@@ -297,7 +298,7 @@ class MySprite(pygame.sprite.Sprite):
             self._theta = -self._theta
             self.d_theta = -self.d_theta
             self.p.refl_y = False
-        self._theta += self.d_theta
+        self._theta += self.d_theta * dt
         self.rect.center = self.p.x, self.p.y
 
 
@@ -321,15 +322,15 @@ class Ship(MySprite):  # This class extends the MySprite class defined above
         images["both"] = pygame.image.load("spaceShip2thrust.png")
         super().__init__(screen, images, x, y, theta, dx, dy, d_theta)
 
-    def update(self, thrust, left, right):
+    def update(self, thrust, left, right, dt=1):
         self.d_theta = 0
         self._theta_dx = -sin(self._theta * pi / 180)
         self._theta_dy = -cos(self._theta * pi / 180)
         engines = "off"
         if thrust:
             engines = "both"
-            self.dx += self.accel * self._theta_dx
-            self.dy += self.accel * self._theta_dy
+            self.dx += self.accel * dt * self._theta_dx
+            self.dy += self.accel * dt * self._theta_dy
         if right:
             self.d_theta = -1.5
             engines = "left" if self.p.flipped else "right"
@@ -339,7 +340,7 @@ class Ship(MySprite):  # This class extends the MySprite class defined above
         if self.p.flipped:
             self.d_theta = -self.d_theta
 
-        self.update_position()
+        self.update_position(dt)
         self.draw(engines)
 
 
@@ -366,16 +367,16 @@ class Bullet(MySprite):
         bullets.add(self)
         self.distance_travelled = 0
 
-    def update(self, bullets, rocks):
+    def update(self, bullets, rocks, dt=1):
         rock = pygame.sprite.spritecollideany(self, rocks, pygame.sprite.collide_circle)
         if rock != None:
             bullets.remove(self)
             rocks.remove(rock)
             rock.destroy(rock.p.x, rock.p.y)
         else:
-            self.distance_travelled += self.speed
+            self.distance_travelled += self.speed * dt
             if self.distance_travelled <= self.distance:
-                self.update_position()
+                self.update_position(dt)
                 if self.distance_travelled >= self.min_dist:
                     self.draw(0)
             else:
@@ -390,8 +391,8 @@ class Rock(MySprite):
         super().__init__(screen, images, x, y, theta, dx, dy, d_theta)
         group.add(self)
 
-    def update(self):
-        self.update_position()
+    def update(self, dt=1):
+        self.update_position(dt)
         self.draw(0)
 
 
@@ -453,8 +454,8 @@ class BigRock(Rock):
         images[1] = pygame.transform.flip(image, True, False)
         super().__init__(screen, images, group, radius, x, y, dx, dy, d_theta)
 
-    def update(self):
-        self.update_position()
+    def update(self, dt=1):
+        self.update_position(dt)
         if self.p.flipped:
             self.draw(1)
         else:
@@ -633,9 +634,10 @@ class Fader:
         self.max_font_size = 60  # max font size
         self.font_size = self.max_font_size
         self._bonus_font = None  # lazily created in lifeBonus
+        self._life_given = False
 
     # does not stop game play
-    def lifeBonus(self):
+    def lifeBonus(self, dt=1):
         # Shrinks to nothing
         # font = pygame.font.Font(None, self.font_size)
         # surf = font.render("BONUS LIFE!",True,RED)
@@ -649,73 +651,75 @@ class Fader:
             0 if self.frames > 255 else 255 - self.frames
         )  # color stays at zero for while
         if color < 220:  # and then counts up to 255
-            surf = font.render("BONUS LIFE!", True, (220, color, color))
+            surf = font.render("BONUS LIFE!", True, (220, int(color), int(color)))
         else:
-            surf = font.render("BONUS LIFE!", True, (color, color, color))
+            surf = font.render("BONUS LIFE!", True, (int(color), int(color), int(color)))
 
         # Fades from blue to white
         color = 100 if self.frames > 255 else 255 - self.frames
         if color < 100:
             surf = font.render("BONUS LIFE!", True, (100, 149, 237))
         elif color < 149:
-            surf = font.render("BONUS LIFE!", True, (color, 149, 237))
+            surf = font.render("BONUS LIFE!", True, (int(color), 149, 237))
         elif color < 237:
-            surf = font.render("BONUS LIFE!", True, (color, color, 237))
+            surf = font.render("BONUS LIFE!", True, (int(color), int(color), 237))
         else:
-            surf = font.render("BONUS LIFE!", True, (color, color, color))
+            surf = font.render("BONUS LIFE!", True, (int(color), int(color), int(color)))
 
         surfRect = surf.get_rect()
         surfRect.center = (winWidth / 2, winHeight / 3)
         self.screen.blit(surf, surfRect)
-        if self.frames <= 2 * self.max_font_size and self.frames % 2 == 0:
-            self.font_size -= 1
-        self.frames -= 1
-        if self.frames == 300:
+        if self.frames <= 2 * self.max_font_size:
+            self.font_size -= 0.5 * dt
+        self.frames -= dt
+        if not self._life_given and self.frames <= 300:
+            self._life_given = True
             Score.addLife()
 
     # stops game play
-    def shipDestroyed(self, frozenSurf):
-        font = pygame.font.SysFont("Arial", self.font_size)
+    def shipDestroyed(self, frozenSurf, dt=1):
+        font = pygame.font.SysFont("Arial", max(1, int(self.font_size)))
         surf = font.render("SHIP DESTROYED!", True, BLUE)
         surfRect = surf.get_rect()
         surfRect.center = (winWidth / 2, 0.3 * winHeight)
         self.screen.blit(frozenSurf, (0, 0, winWidth, winHeight))
         self.screen.blit(surf, surfRect)
-        if self.frames <= 2 * self.max_font_size and self.frames % 2 == 0:
-            self.font_size -= 1
-        self.frames -= 1
+        if self.frames <= 2 * self.max_font_size:
+            self.font_size -= 0.5 * dt
+        self.frames -= dt
 
     # helper method for ship Destroyed
     def use_a_life(self):
         Score.delLife()
         while self.frames > 0:
+            dt = fpsClock.tick(FPS) * REFERENCE_FPS / 1000.0
             if self.is_max():
                 freezeScreen = self.screen.subsurface(
                     pygame.Rect(0, 0, WIDTH, HEIGHT)
                 ).copy()
-                self.shipDestroyed(freezeScreen)
+                self.shipDestroyed(freezeScreen, dt)
             else:
-                self.shipDestroyed(freezeScreen)
+                self.shipDestroyed(freezeScreen, dt)
             pygame.display.update()
-            fpsClock.tick(FPS)
 
-    def title_banner(self):
+    def title_banner(self, dt=1):
+        font_diff = max(1, int(self.max_font_size - self.font_size + 1))
         textBlit(
             self.screen,
             "ASTEROIDS",
             "Arial",
-            self.max_font_size - self.font_size + 1,
+            font_diff,
             BLUE,
             "center",
             winWidth / 2,
             winHeight / 8
-            + (self.max_font_size - self.font_size + 1)
+            + font_diff
             * winHeight
             / (15 * self.max_font_size),
         )
-        if self.frames > 2 * self.max_font_size and self.frames % 2 == 0:
-            self.font_size -= 1
-        self.frames -= 1
+        if self.frames > 2 * self.max_font_size:
+            self.font_size -= 0.5 * dt
+        self.frames -= dt
 
     def start_up(self):
         global Space
@@ -728,6 +732,7 @@ class Fader:
         burst = Burst()
 
         while run:
+            dt = fpsClock.tick(FPS) * REFERENCE_FPS / 1000.0
             for event in pygame.event.get():
                 if event.type == QUIT:
                     pygame.quit()
@@ -778,27 +783,21 @@ class Fader:
             self.screen.fill(WHITE)
 
             if starting_up and self.frames > 0:
-                self.title_banner()
+                self.title_banner(dt)
             else:
                 starting_up = False
 
             if not starting_up:
                 self.screen.blit(infoSurf, (0, 0, winWidth, winHeight))
 
-            ship.update(thrust, left, right)
+            ship.update(thrust, left, right, dt)
 
-            if burst.shoot:
-                if burst.frame > 0:
-                    if burst.frame % burst.delay == 0:
-                        Bullet(self.screen, ship, bullets)
-                    burst.decriment()
-                else:
-                    burst.reset()
+            if burst.update(dt):
+                Bullet(self.screen, ship, bullets)
 
-            bullets.update(bullets, rocks)
+            bullets.update(bullets, rocks, dt)
 
             pygame.display.update()
-            fpsClock.tick(FPS)
 
         self.reset()
         bullets.empty()
@@ -1016,6 +1015,7 @@ class Fader:
     def reset(self):
         self.frames = self.frames_max
         self.font_size = self.max_font_size
+        self._life_given = False
 
     def is_max(self):
         return self.frames == self.frames_max
@@ -1071,15 +1071,28 @@ class Fader:
 class Burst:
     def __init__(self, num=5, delay=20, shoot=False):
         self.num = num
-        self.delay = delay
+        self.delay = delay  # reference frames between shots
         self.shoot = shoot
-        self.frame = self.num * self.delay
+        self.shots_left = num
+        self.timer = self.delay  # fires immediately on first update
 
-    def decriment(self):
-        self.frame -= 1
+    def update(self, dt):
+        """Returns True when a bullet should be fired."""
+        if not self.shoot:
+            return False
+        if self.shots_left <= 0:
+            self.reset()
+            return False
+        self.timer += dt
+        if self.timer >= self.delay:
+            self.timer -= self.delay
+            self.shots_left -= 1
+            return True
+        return False
 
     def reset(self):
-        self.frame = self.num * self.delay
+        self.shots_left = self.num
+        self.timer = self.delay  # fires immediately on next burst
         self.shoot = False
 
 
@@ -1114,6 +1127,7 @@ def main():
     num_rocks = NUM_ROCKS
 
     while True:
+        dt = fpsClock.tick(FPS) * REFERENCE_FPS / 1000.0
         for event in pygame.event.get():
             if event.type == QUIT:
                 pygame.quit()
@@ -1140,19 +1154,14 @@ def main():
 
         screen.fill(WHITE)
 
-        ship.update(thrust, left, right)
+        ship.update(thrust, left, right, dt)
 
-        if burst.shoot:
-            if burst.frame > 0:
-                if burst.frame % burst.delay == 0:
-                    Bullet(screen, ship, bullets)
-                burst.decriment()
-            else:
-                burst.reset()
+        if burst.update(dt):
+            Bullet(screen, ship, bullets)
 
         if bullets:
-            bullets.update(bullets, rocks)
-        rocks.update()
+            bullets.update(bullets, rocks, dt)
+        rocks.update(dt)
 
         if pygame.sprite.spritecollideany(
             ship, rocks, pygame.sprite.collide_circle_ratio(0.7)
@@ -1175,7 +1184,7 @@ def main():
 
         if len(rocks) == 0:
             if fader.frames > 0:
-                fader.lifeBonus()
+                fader.lifeBonus(dt)
             else:
                 fader.reset()
                 bullets.empty()
@@ -1188,7 +1197,6 @@ def main():
             pause = fader.info(pause)
 
         pygame.display.update()
-        fpsClock.tick(FPS)
 
 
 main()
