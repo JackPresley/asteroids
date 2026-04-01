@@ -309,10 +309,18 @@ class Ship(MySprite):  # This class extends the MySprite class defined above
     def _init_images(cls):
         if cls._images_cache is None:
             cls._images_cache = {}
-            cls._images_cache["off"] = pygame.image.load("spaceShip2.png").convert_alpha()
-            cls._images_cache["right"] = pygame.image.load("spaceShip2right.png").convert_alpha()
-            cls._images_cache["left"] = pygame.transform.flip(cls._images_cache["right"], True, False)
-            cls._images_cache["both"] = pygame.image.load("spaceShip2thrust.png").convert_alpha()
+            cls._images_cache["off"] = pygame.image.load(
+                "spaceShip2.png"
+            ).convert_alpha()
+            cls._images_cache["right"] = pygame.image.load(
+                "spaceShip2right.png"
+            ).convert_alpha()
+            cls._images_cache["left"] = pygame.transform.flip(
+                cls._images_cache["right"], True, False
+            )
+            cls._images_cache["both"] = pygame.image.load(
+                "spaceShip2thrust.png"
+            ).convert_alpha()
 
     def __init__(
         self,
@@ -359,9 +367,7 @@ class Bullet(MySprite):
     def _init_image(cls):
         if cls._image_cache is None:
             r = cls.RADIUS
-            image = pygame.Surface(
-                [2 * r, 2 * r], pygame.SRCALPHA, 32
-            ).convert_alpha()
+            image = pygame.Surface([2 * r, 2 * r], pygame.SRCALPHA, 32).convert_alpha()
             image.fill((255, 255, 255, 0))
             pygame.draw.circle(image, (0, 0, 0), (r, r), r)
             cls._image_cache = image
@@ -597,7 +603,7 @@ class Score:
             35,
             RED,
             "topleft",
-            4 * winWidth / 20,
+            5 * winWidth / 20,
             winHeight / 20,
             False,
         )
@@ -670,7 +676,9 @@ class Fader:
         if color < 220:  # and then counts up to 255
             surf = font.render("BONUS LIFE!", True, (220, int(color), int(color)))
         else:
-            surf = font.render("BONUS LIFE!", True, (int(color), int(color), int(color)))
+            surf = font.render(
+                "BONUS LIFE!", True, (int(color), int(color), int(color))
+            )
 
         # Fades from blue to white
         color = 100 if self.frames > 255 else 255 - self.frames
@@ -681,7 +689,9 @@ class Fader:
         elif color < 237:
             surf = font.render("BONUS LIFE!", True, (int(color), int(color), 237))
         else:
-            surf = font.render("BONUS LIFE!", True, (int(color), int(color), int(color)))
+            surf = font.render(
+                "BONUS LIFE!", True, (int(color), int(color), int(color))
+            )
 
         surfRect = surf.get_rect()
         surfRect.center = (winWidth / 2, winHeight / 3)
@@ -733,10 +743,7 @@ class Fader:
             BLUE,
             "center",
             winWidth / 2,
-            winHeight / 8
-            + font_diff
-            * winHeight
-            / (15 * self.max_font_size),
+            winHeight / 8 + font_diff * winHeight / (15 * self.max_font_size),
         )
         if self.frames > 2 * self.max_font_size:
             self.font_size -= 0.5 * dt
@@ -1220,4 +1227,6 @@ def main():
         pygame.display.update()
 
 
-main()
+if __name__ == "__main__":
+
+    main()
