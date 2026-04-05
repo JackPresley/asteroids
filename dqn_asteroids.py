@@ -20,7 +20,7 @@ import numpy as np
 # Game constants (must match asteroids.py)
 # ---------------------------------------------------------------------------
 
-NUM_ROCKS = 3
+NUM_ROCKS = 5
 WIDTH = 900
 HEIGHT = 700
 winWidth = WIDTH + 1
@@ -179,33 +179,37 @@ ACTIONS = [
 ]
 
 SHIP_RADIUS = 18
-SIM_STEPS_PER_ACTION = 10
+SIM_STEPS_PER_ACTION = 4
 
 # ---------------------------------------------------------------------------
 # Hyperparameters
 # ---------------------------------------------------------------------------
 
 MAX_ROCKS = 8           # observe up to this many rocks
-MAX_BULLETS = 4         # observe up to this many bullets
+MAX_BULLETS = 2         # observe up to this many bullets
 SHIP_FEATURES = 10      # ship state + cooldown + bullet count
 ROCK_FEATURES = 7       # pos(2) + vel(2) + radius + aim_dot + aim_cross
 BULLET_FEATURES = 5     # pos(2) + vel(2) + nearest_rock_dist
 STATE_DIM = SHIP_FEATURES + MAX_ROCKS * ROCK_FEATURES + MAX_BULLETS * BULLET_FEATURES
 N_ACTIONS = len(ACTIONS)
 
-GAMMA = 0.99
-LR = 5e-4
-BATCH_SIZE = 128
+GAMMA = 0.995
+LR_START = 1e-4
+LR_END = 1e-4
+LR_DECAY_STEPS = 1          # not used with constant LR
+BATCH_SIZE = 256
 REPLAY_SIZE = 200_000
-TARGET_UPDATE = 500     # steps between target network syncs
+TARGET_TAU = 0.01           # Polyak soft-update rate for target network
+GRAD_STEPS_PER_ENV = 4      # gradient updates per environment step
+GRAD_CLIP = 1.0             # max gradient norm
 EPS_START = 1.0
 EPS_END = 0.05
-EPS_DECAY = 100_000     # linear decay over this many steps
-MAX_EPISODE_STEPS = 16000  # ~267 seconds of game time at 60fps
+EPS_DECAY = 500_000         # linear decay over this many steps
+MAX_EPISODE_STEPS = 16000   # ~267 seconds of game time at 60fps
 
 # Prioritized Experience Replay
-PER_ALPHA = 0.6         # prioritization exponent (0 = uniform, 1 = full priority)
-PER_BETA_START = 0.4    # importance-sampling correction (annealed to 1.0)
+PER_ALPHA = 0.4
+PER_BETA_START = 0.6
 PER_BETA_END = 1.0
 PER_BETA_FRAMES = 100_000
 PER_EPSILON = 1e-6
@@ -296,6 +300,7 @@ class AsteroidsEnv:
 
     def __init__(self, num_rocks=1):
         self.num_rocks = num_rocks
+        self.wave_rocks = num_rocks  # rocks in current wave (grows each wave)
         self.ship = None
         self.rocks = []
         self.bullets = []
@@ -305,9 +310,10 @@ class AsteroidsEnv:
         self.shoot_cooldown = 0
 
     def reset(self):
+        self.wave_rocks = self.num_rocks
         self.ship = SimShip(winWidth / 2, winHeight / 2, 0, 0, 0)
         self.rocks = []
-        for _ in range(self.num_rocks):
+        for _ in range(self.wave_rocks):
             self._spawn_big_rock()
         self.bullets = []
         self.steps = 0
@@ -396,13 +402,9 @@ class AsteroidsEnv:
                         if torus_dist(b.x, b.y, r.x, r.y) < r.radius + 5:
                             hit_rocks.add(ri)
                             hit_bullets.add(bi)
-                            # Big reward for destroying rocks
-                            if r.radius >= 50:
-                                reward += 20.0
-                            elif r.radius >= 30:
-                                reward += 30.0
-                            else:
-                                reward += 50.0
+                            # Flat kill reward — avoid over-incentivizing
+                            # engagement with dangerous small-rock swarms
+                            reward += 30.0
                             break
 
             if hit_rocks:
@@ -416,46 +418,30 @@ class AsteroidsEnv:
             for r in self.rocks:
                 if torus_dist(self.ship.x, self.ship.y, r.x, r.y) < r.radius * 0.7 + SHIP_RADIUS:
                     self.alive = False
-                    reward -= 10.0
+                    reward -= 100.0
                     self.steps += 1
                     obs = build_observation(self.ship, self.rocks, self.bullets, self.shoot_cooldown)
                     return obs, reward, True
 
         self.steps += 1
 
-        # Cleared all rocks bonus — episode ends immediately after
+        # Wave cleared: bonus scales with wave size, pushing the agent
+        # toward progression instead of settling for passive survival.
         if len(self.rocks) == 0:
-            reward += 100.0
-            obs = build_observation(self.ship, self.rocks, self.bullets, self.shoot_cooldown)
-            self.score += reward
-            return obs, reward, True
+            reward += 100.0 * self.wave_rocks
+            self.wave_rocks += 1
+            for _ in range(self.wave_rocks):
+                self._spawn_big_rock()
 
-        # Quadratic speed penalty: gentle at low speeds, ramps up sharply
-        # to discourage high-speed flight without a hard clamp.
-        speed = sqrt(self.ship.dx ** 2 + self.ship.dy ** 2)
-        if speed > 0.5:
-            reward -= 0.3 * (speed - 0.5) ** 2
+        # Per-step survival bonus: encourage survival
+        reward += 1.0
 
-        # Proximity penalty: static penalty for being near rocks
+        # Proximity penalty: small nudge to keep safe distance
         min_dist = self._min_rock_dist()
-        if min_dist < 80:
-            reward -= 1.0 * (1.0 - min_dist / 80.0)
-
-        # Aiming reward: reward when ship heading points toward nearest rock.
-        # Gives a gradient toward "turn to face rocks" which leads to shooting.
-        nearest = min(self.rocks, key=lambda r: torus_dist(self.ship.x, self.ship.y, r.x, r.y))
-        dx_to = wrap_delta(self.ship.x, nearest.x, winWidth)
-        dy_to = wrap_delta(self.ship.y, nearest.y, winHeight)
-        dist_to = sqrt(dx_to ** 2 + dy_to ** 2)
-        if dist_to > 1e-6:
-            fwd_x = -sin(self.ship.theta * pi / 180)
-            fwd_y = -cos(self.ship.theta * pi / 180)
-            aim_dot = (fwd_x * dx_to + fwd_y * dy_to) / dist_to
-            if aim_dot > 0:
-                reward += 0.5 * aim_dot
-
-        # Small per-step survival bonus: rewards staying alive
-        reward += 0.1
+        if min_dist < 100:
+            safe_dist = max(0.0, min_dist)
+            penalty = 0.1 * (1.0 - safe_dist / 100.0)
+            reward -= penalty
 
         done = self.steps >= MAX_EPISODE_STEPS
         obs = build_observation(self.ship, self.rocks, self.bullets, self.shoot_cooldown)
@@ -470,7 +456,7 @@ class AsteroidsEnv:
 class DuelingQNetwork(nn.Module):
     """Dueling DQN: separate value and advantage streams."""
 
-    def __init__(self, state_dim=STATE_DIM, n_actions=N_ACTIONS, hidden=384):
+    def __init__(self, state_dim=STATE_DIM, n_actions=N_ACTIONS, hidden=512):
         super().__init__()
         half = hidden // 2
         self.shared = nn.Sequential(
@@ -659,23 +645,28 @@ class DQNAgent:
     def __init__(self, state_dim=STATE_DIM, n_actions=N_ACTIONS, device=None):
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.n_actions = n_actions
-        self.q_net = DuelingQNetwork(state_dim, n_actions).to(self.device)
-        self.target_net = DuelingQNetwork(state_dim, n_actions).to(self.device)
+        self.q_net = DuelingQNetwork(state_dim, n_actions, hidden=512).to(self.device)
+        self.target_net = DuelingQNetwork(state_dim, n_actions, hidden=512).to(self.device)
         self.target_net.load_state_dict(self.q_net.state_dict())
         self.target_net.eval()
-        self.optimizer = optim.Adam(self.q_net.parameters(), lr=LR)
+        self.optimizer = optim.Adam(self.q_net.parameters(), lr=LR_START)
         self.replay = PrioritizedReplayBuffer()
         self.nstep = NStepBuffer()
-        self.total_steps = 0
+        self.total_steps = 0       # gradient steps (for target net sync)
+        self.env_steps = 0         # environment steps (for schedules)
         self._gamma_n = GAMMA ** N_STEPS
 
+    def _update_lr(self):
+        """Constant learning rate."""
+        for pg in self.optimizer.param_groups:
+            pg["lr"] = LR_START
+
     def epsilon(self):
-        frac = min(1.0, self.total_steps / EPS_DECAY)
+        frac = min(1.0, self.env_steps / EPS_DECAY)
         return EPS_START + (EPS_END - EPS_START) * frac
 
     def beta(self):
-        """Current beta for PER importance-sampling correction."""
-        frac = min(1.0, self.total_steps / PER_BETA_FRAMES)
+        frac = min(1.0, self.env_steps / PER_BETA_FRAMES)
         return PER_BETA_START + (PER_BETA_END - PER_BETA_START) * frac
 
     def act(self, state, eval_mode=False):
@@ -687,15 +678,24 @@ class DQNAgent:
             return q_vals.argmax(dim=1).item()
 
     def push_transition(self, state, action, reward, next_state, done):
-        """Push a 1-step transition through the n-step buffer into replay."""
+        """Push raw reward through n-step buffer into replay."""
         transitions = self.nstep.push(state, action, reward, next_state, done)
         for t in transitions:
             self.replay.push(*t)
+        self.env_steps += 1
+        self._update_lr()
 
     def train_step(self):
+        """Perform GRAD_STEPS_PER_ENV gradient updates."""
         if len(self.replay) < BATCH_SIZE:
             return None
 
+        last_loss = None
+        for _ in range(GRAD_STEPS_PER_ENV):
+            last_loss = self._one_gradient_step()
+        return last_loss
+
+    def _one_gradient_step(self):
         beta = self.beta()
         states, actions, rewards, next_states, dones, indices, is_weights = \
             self.replay.sample(BATCH_SIZE, beta)
@@ -707,10 +707,8 @@ class DQNAgent:
         dones_t = torch.tensor(dones, dtype=torch.float32, device=self.device)
         weights_t = torch.tensor(is_weights, dtype=torch.float32, device=self.device)
 
-        # Current Q values for chosen actions
         q_values = self.q_net(states_t).gather(1, actions_t.unsqueeze(1)).squeeze(1)
 
-        # Target Q values (Double DQN + n-step bootstrap)
         with torch.no_grad():
             next_actions = self.q_net(next_states_t).argmax(dim=1)
             next_q = self.target_net(next_states_t).gather(1, next_actions.unsqueeze(1)).squeeze(1)
@@ -721,16 +719,17 @@ class DQNAgent:
 
         self.optimizer.zero_grad()
         loss.backward()
-        nn.utils.clip_grad_norm_(self.q_net.parameters(), 10.0)
+        nn.utils.clip_grad_norm_(self.q_net.parameters(), GRAD_CLIP)
         self.optimizer.step()
 
-        # Update priorities in replay buffer
         self.replay.update_priorities(indices, td_errors.cpu().numpy())
 
-        self.total_steps += 1
-        if self.total_steps % TARGET_UPDATE == 0:
-            self.target_net.load_state_dict(self.q_net.state_dict())
+        # Polyak soft update of target network
+        with torch.no_grad():
+            for tp, op in zip(self.target_net.parameters(), self.q_net.parameters()):
+                tp.data.mul_(1.0 - TARGET_TAU).add_(op.data, alpha=TARGET_TAU)
 
+        self.total_steps += 1
         return loss.item()
 
     def save(self, path="dqn_model.pt"):
@@ -739,6 +738,7 @@ class DQNAgent:
             "target_net": self.target_net.state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "total_steps": self.total_steps,
+            "env_steps": self.env_steps,
         }, path)
 
     def load(self, path="dqn_model.pt"):
@@ -748,6 +748,7 @@ class DQNAgent:
             self.target_net.load_state_dict(ckpt["target_net"])
             self.optimizer.load_state_dict(ckpt["optimizer"])
             self.total_steps = ckpt["total_steps"]
+            self.env_steps = ckpt.get("env_steps", self.total_steps)
         except RuntimeError:
             print("  Checkpoint incompatible with current architecture, starting fresh.")
             return
@@ -757,7 +758,7 @@ class DQNAgent:
 # Training loop
 # ---------------------------------------------------------------------------
 
-def train(num_episodes=5000, save_every=100, model_path="dqn_model.pt"):
+def train(num_episodes=20000, save_every=100, model_path="dqn_model.pt"):
     agent = DQNAgent()
     print(f"Device: {agent.device}")
 
@@ -765,6 +766,7 @@ def train(num_episodes=5000, save_every=100, model_path="dqn_model.pt"):
     if os.path.exists(model_path):
         print(f"Resuming from {model_path}")
         agent.load(model_path)
+        agent.env_steps = 0  # restart schedules; replay buffer is not saved anyway
 
     # Curriculum: start with 1 rock, increase when agent is doing well
     cur_rocks = 1
@@ -773,11 +775,14 @@ def train(num_episodes=5000, save_every=100, model_path="dqn_model.pt"):
     reward_history = deque(maxlen=100)
     length_history = deque(maxlen=100)
 
-    # Curriculum thresholds: avg reward above this -> add a rock
-    CURRICULUM_THRESHOLD = 60.0
-    CURRICULUM_MIN_EPS = 200  # don't promote before this many episodes at current level
+    # Curriculum thresholds: avg reward above this -> add a rock.
+    # Calibrated so agent must solidly clear wave 1 before promotion
+    # (wave 1 clear ≈ 7 kills × 20 + 100 bonus + survival ≈ 350-450).
+    CURRICULUM_THRESHOLD = 500.0
+    CURRICULUM_MIN_EPS = 100  # don't promote before this many episodes at current level
 
     eps_at_level = 0
+    restore_cooldown = 0  # save-cycles to wait before next restore check
 
     for ep in range(1, num_episodes + 1):
         state = env.reset()
@@ -801,11 +806,12 @@ def train(num_episodes=5000, save_every=100, model_path="dqn_model.pt"):
         eps_at_level += 1
 
         if ep % 10 == 0:
+            cur_lr = agent.optimizer.param_groups[0]["lr"]
             print(
                 f"Ep {ep:5d} | R {ep_reward:7.1f} | avg100 {avg:7.1f} | "
                 f"len {ep_steps:4d} | avglen {avg_len:5.0f} | "
-                f"eps {agent.epsilon():.3f} | rocks {cur_rocks} | "
-                f"buf {len(agent.replay)}"
+                f"eps {agent.epsilon():.3f} | lr {cur_lr:.1e} | "
+                f"rocks {cur_rocks} | buf {len(agent.replay)}"
             )
 
         # Curriculum: promote to more rocks when agent is consistently good
@@ -818,6 +824,8 @@ def train(num_episodes=5000, save_every=100, model_path="dqn_model.pt"):
             reward_history.clear()
             length_history.clear()
             eps_at_level = 0
+            best_reward = -float("inf")
+            restore_cooldown = 0
             print(f"=== CURRICULUM: now training with {cur_rocks} rocks ===")
 
         if ep % save_every == 0:
@@ -826,6 +834,16 @@ def train(num_episodes=5000, save_every=100, model_path="dqn_model.pt"):
                 best_reward = avg
                 agent.save(model_path.replace(".pt", "_best.pt"))
                 print(f"  -> new best avg reward: {best_reward:.1f}")
+                restore_cooldown = 0
+            elif restore_cooldown > 0:
+                restore_cooldown -= 1
+            elif (best_reward > 100.0
+                    and len(reward_history) >= 100
+                    and avg < 0.7 * best_reward):
+                print(f"  !! DEGRADATION: avg {avg:.1f} << best {best_reward:.1f}, "
+                      f"restoring best weights")
+                agent.load(model_path.replace(".pt", "_best.pt"))
+                restore_cooldown = 3
 
     agent.save(model_path)
     print("Training complete.")
@@ -944,7 +962,7 @@ if __name__ == "__main__":
     sub = parser.add_subparsers(dest="command")
 
     train_p = sub.add_parser("train", help="Train the DQN agent")
-    train_p.add_argument("--episodes", type=int, default=5000)
+    train_p.add_argument("--episodes", type=int, default=20000)
     train_p.add_argument("--save-every", type=int, default=100)
     train_p.add_argument("--model", default="dqn_model.pt")
 
