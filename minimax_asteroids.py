@@ -154,8 +154,6 @@ class SimBullet:
         self.dist_left -= self.speed * dt
 
 
-SHOOT_SPEED_MAX = 0.8  # ship must be slower than this to fire
-
 def make_sim_bullet(ship_sim):
     speed = 5
     tdx = -sin(ship_sim.theta * pi / 180)
@@ -234,6 +232,22 @@ def evaluate(ship, rocks, bullets):
     # Reward keeping distance from rocks
     score += min(min_dist, 300)
 
+    # Multi-rock convergence penalty: when N rocks are simultaneously closing in
+    # the danger is superlinear because no single escape vector works for all of them.
+    converging = 0
+    for r in rocks:
+        rdx = wrap_delta(ship.x, r.x, winWidth)
+        rdy = wrap_delta(ship.y, r.y, winHeight)
+        dist_full = sqrt(rdx * rdx + rdy * rdy)
+        gap = dist_full - r.radius - SHIP_RADIUS
+        if gap < 150 and dist_full > 1e-6:
+            ux, uy = rdx / dist_full, rdy / dist_full
+            closing = -((r.dx - ship.dx) * ux + (r.dy - ship.dy) * uy)
+            if closing > 0.05:
+                converging += 1
+    if converging >= 2:
+        score -= 600 * (converging - 1) ** 2
+
     # Reward bullets closing on rocks (closing-speed aware)
     for b in bullets:
         for r in rocks:
@@ -298,6 +312,18 @@ def evaluate(ship, rocks, bullets):
                 best_d, best_x, best_y = gd, gx, gy
     score += 400 * max(0.0, 1.0 - torus_dist(ship.x, ship.y, best_x, best_y) / (_DIAG * 0.4))
 
+    # Velocity toward safe zone: reward heading toward the safest cell when not already there.
+    # This encourages proactive repositioning rather than only rewarding arrival.
+    dist_to_safe = torus_dist(ship.x, ship.y, best_x, best_y)
+    if dist_to_safe > 80 and speed > 0.05:
+        sdx = wrap_delta(ship.x, best_x, winWidth)
+        sdy = wrap_delta(ship.y, best_y, winHeight)
+        safe_ux = sdx / dist_to_safe
+        safe_uy = sdy / dist_to_safe
+        vel_toward = (ship.dx * safe_ux + ship.dy * safe_uy) / speed
+        if vel_toward > 0:
+            score += 150 * vel_toward * min(1.0, dist_to_safe / 200)
+
     # Centre return: graded by rock count; last-rock sequence adds big rewards
     cx, cy = winWidth / 2, winHeight / 2
     dist_centre = torus_dist(ship.x, ship.y, cx, cy)
@@ -313,6 +339,38 @@ def evaluate(ship, rocks, bullets):
         score += 200 * centred
 
     return score
+
+
+def _spawn_children(rock):
+    """Return deterministic child SimRocks for minimax simulation.
+
+    The real game randomises child velocities; we use a fixed perpendicular
+    split so the simulation is consistent across search nodes.  Children
+    scatter perpendicular to the parent's travel direction (or along the x
+    axis if the parent is stationary), which keeps them from immediately
+    overlapping and gives a representative worst-case spread.
+    """
+    children = []
+    if rock.radius == 50:  # BigRock -> 2 MediumRock at avg speed ~0.5/axis
+        spd = 0.5
+        mag = sqrt(rock.dx ** 2 + rock.dy ** 2)
+        if mag < 1e-6:
+            px, py = 1.0, 0.0
+        else:
+            px, py = -rock.dy / mag, rock.dx / mag  # unit perpendicular
+        children.append(SimRock(rock.x, rock.y, px * spd, py * spd, 30))
+        children.append(SimRock(rock.x, rock.y, -px * spd, -py * spd, 30))
+    elif rock.radius == 30:  # MediumRock -> 2 SmallRock at avg speed ~0.7/axis
+        spd = 0.7
+        mag = sqrt(rock.dx ** 2 + rock.dy ** 2)
+        if mag < 1e-6:
+            px, py = 1.0, 0.0
+        else:
+            px, py = -rock.dy / mag, rock.dx / mag
+        children.append(SimRock(rock.x, rock.y, px * spd, py * spd, 15))
+        children.append(SimRock(rock.x, rock.y, -px * spd, -py * spd, 15))
+    # SmallRock -> nothing
+    return children
 
 
 def sim_step(ship, rocks, bullets, action):
@@ -346,9 +404,10 @@ def sim_step(ship, rocks, bullets, action):
                     hit_bullets.add(bi)
                     break
         if hit_rocks:
-            # Rock destruction spawns children at random velocities in the real game.
-            # We remove the rock conservatively (no children) as a safe approximation.
-            new_rocks = [r for i, r in enumerate(new_rocks) if i not in hit_rocks]
+            spawned = []
+            for ri in hit_rocks:
+                spawned.extend(_spawn_children(new_rocks[ri]))
+            new_rocks = [r for i, r in enumerate(new_rocks) if i not in hit_rocks] + spawned
             new_bullets = [b for i, b in enumerate(new_bullets) if i not in hit_bullets]
 
         # Check ship-rock collision
@@ -357,6 +416,20 @@ def sim_step(ship, rocks, bullets, action):
                 return new_ship, new_rocks, new_bullets, True  # dead
 
     return new_ship, new_rocks, new_bullets, False
+
+
+def _order_actions(ship, rocks, bullets):
+    """Return action indices sorted by quick 1-step evaluation (best first).
+
+    This lets alpha-beta pruning cut more branches at deeper levels.
+    """
+    scored = []
+    for ai, action in enumerate(ACTIONS):
+        new_ship, new_rocks, new_bullets, dead = sim_step(ship, rocks, bullets, action)
+        s = -100000 if dead else evaluate(new_ship, new_rocks, new_bullets)
+        scored.append((s, ai))
+    scored.sort(reverse=True)
+    return [ai for _, ai in scored]
 
 
 def minimax(ship, rocks, bullets, depth, bound=float('inf')):
@@ -370,10 +443,18 @@ def minimax(ship, rocks, bullets, depth, bound=float('inf')):
     if depth == 0 or not rocks:
         return evaluate(ship, rocks, bullets), 0
 
+    # Apply move ordering only at the root to maximise pruning there without
+    # doubling work at every internal node.
+    if depth == DEPTH:
+        ordered = _order_actions(ship, rocks, bullets)
+    else:
+        ordered = range(len(ACTIONS))
+
     best_score = float('-inf')
     best_action = 0
 
-    for ai, action in enumerate(ACTIONS):
+    for ai in ordered:
+        action = ACTIONS[ai]
         new_ship, new_rocks, new_bullets, dead = sim_step(ship, rocks, bullets, action)
         if dead:
             action_score = -100000
@@ -441,7 +522,7 @@ class AIController:
             if self.action[3] and self.shoot_cooldown > 0:
                 self.action = (self.action[0], self.action[1], self.action[2], False)
             elif self.action[3]:
-                self.shoot_cooldown = 15  # reference frames between shots
+                self.shoot_cooldown = 20  # reference frames between shots (matches Burst delay)
 
         return self.action
 
