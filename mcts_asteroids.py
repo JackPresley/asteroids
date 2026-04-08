@@ -402,29 +402,40 @@ def static_eval(state):
                     safe_mult = 0.2  # discourage hitting big rocks near us
                 score += 12.0 * dot * safe_mult
 
-    # -- Aim alignment: reward heading toward a good target --
+    # -- Aim alignment: reward heading toward incoming targets --
+    # Only reward aiming at rocks that are approaching us (closing > 0).
+    # This encourages "turret" play: rotate to face incoming threats
+    # rather than chasing distant rocks.
     best_aim = 0.0
     for r, dx_to, dy_to, cdist, edist, closing in rock_info:
-        if cdist < 1:
-            continue
+        if cdist < 1 or closing < 0:
+            continue  # skip rocks moving away -- they'll come back around
         nx = dx_to / cdist
         ny = dy_to / cdist
         dot = fwd_x * nx + fwd_y * ny  # 1 = pointing right at it
         if dot > 0.7:
-            # Prefer aiming at small rocks (safe to kill) or distant big rocks
-            aim_val = dot * 5.0
+            aim_val = dot * 6.0
+            # Prefer aiming at rocks that are closer to firing range
+            if edist < 350:
+                aim_val *= 1.3
             if r.radius < 30:
-                aim_val *= 1.5  # small rocks are safe targets
+                aim_val *= 1.5  # small rocks are safest to kill
             elif edist < 130:
                 aim_val *= 0.3  # don't aim at close big rocks
             if aim_val > best_aim:
                 best_aim = aim_val
     score += best_aim
 
-    # -- Speed management --
+    # -- Station-keeping: strongly reward low speed --
+    # On a torus every rock comes back; chasing is pure risk.
+    # Being slow means more reaction time and tighter dodge radius.
     speed = sqrt(ship.dx ** 2 + ship.dy ** 2)
-    if speed > 2.5:
-        score -= (speed - 2.5) ** 2 * 2.0
+    if speed < 0.5:
+        score += 15.0          # nearly stationary -- ideal
+    elif speed < 1.5:
+        score += 8.0 * (1.5 - speed)  # gentle reward for being slow
+    else:
+        score -= (speed - 1.5) ** 2 * 4.0  # escalating penalty
 
     return score
 
@@ -440,12 +451,28 @@ def prune_actions(state):
 
     if not state.rocks:
         speed = sqrt(ship.dx ** 2 + ship.dy ** 2)
-        if speed > 1.5:
-            return [0, 1, 2, 3, 4, 5]
+        if speed > 1.0:
+            return [0, 1, 2, 3, 4, 5]  # include thrust for braking
         return [0]
 
-    # Always consider movement
-    actions = [0, 1, 2, 3, 4, 5]
+    # Check if any rock is an immediate threat
+    speed = sqrt(ship.dx ** 2 + ship.dy ** 2)
+    nearest_edge = float('inf')
+    for r in state.rocks:
+        d = torus_dist(ship.x, ship.y, r.x, r.y) - r.radius
+        if d < nearest_edge:
+            nearest_edge = d
+
+    if nearest_edge < 120 or speed > 2.0:
+        # In danger or moving too fast: full movement set for dodging/braking
+        actions = [0, 1, 2, 3, 4, 5]
+    else:
+        # Safe: prefer station-keeping -- rotate and drift, thrust only rarely.
+        # Keeping thrust available lets MCTS use it if truly needed,
+        # but the smaller action set steers search toward turning + waiting.
+        actions = [0, 2, 3]  # drift, turn-left, turn-right
+        if speed > 1.0:
+            actions.append(1)  # thrust for braking
 
     if can_shoot:
         # Check if we're aimed at a big/medium rock that's close --
@@ -469,7 +496,12 @@ def prune_actions(state):
                 break
 
         if not suppress_shoot:
-            actions.extend([6, 7, 8, 9])
+            actions.append(6)  # shoot
+            actions.append(7)  # left+shoot
+            actions.append(8)  # right+shoot
+            # Only include thrust+shoot when dodging (already have thrust)
+            if 1 in actions:
+                actions.append(9)
 
     return actions
 
