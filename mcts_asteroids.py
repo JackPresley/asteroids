@@ -265,7 +265,7 @@ class GameState:
 
 _SIN8 = [sin(i * pi / 4) for i in range(8)]
 _COS8 = [cos(i * pi / 4) for i in range(8)]
-LOOKAHEAD_FRAMES = 20  # project rock positions forward this many frames
+CPA_HORIZON = 60  # frames to look ahead for closest-point-of-approach
 
 
 def static_eval(state):
@@ -285,7 +285,7 @@ def static_eval(state):
     fwd_x = -sin(ship.theta * pi / 180)
     fwd_y = -cos(ship.theta * pi / 180)
 
-    # -- Danger from current AND projected rock positions --
+    # -- Danger from current position AND closest-point-of-approach --
     min_edge_dist = float('inf')
     total_danger = 0.0
     rock_info = []  # cache for reuse below
@@ -296,9 +296,9 @@ def static_eval(state):
         center_dist = sqrt(dx_to * dx_to + dy_to * dy_to)
         edge_dist = center_dist - r.radius
 
-        # Relative velocity
-        rel_vx = r.dx - ship.dx
-        rel_vy = r.dy - ship.dy
+        # Relative velocity (rock motion in ship's frame)
+        rel_vx = (r.dx - ship.dx) * SIM_DT
+        rel_vy = (r.dy - ship.dy) * SIM_DT
         closing = (dx_to * rel_vx + dy_to * rel_vy) / max(1.0, center_dist)
 
         rock_info.append((r, dx_to, dy_to, center_dist, edge_dist, closing))
@@ -314,19 +314,36 @@ def static_eval(state):
             size_mult = r.radius / 30.0
             total_danger += proximity * speed_mult * size_mult
 
-        # Danger from PROJECTED position (where the rock will be in ~20 frames)
-        # This gives early warning for incoming threats
-        proj_rx = (r.x + r.dx * SIM_DT * LOOKAHEAD_FRAMES) % winWidth
-        proj_ry = (r.y + r.dy * SIM_DT * LOOKAHEAD_FRAMES) % winHeight
-        proj_sx = (ship.x + ship.dx * SIM_DT * LOOKAHEAD_FRAMES) % winWidth
-        proj_sy = (ship.y + ship.dy * SIM_DT * LOOKAHEAD_FRAMES) % winHeight
-        proj_dist = torus_dist(proj_sx, proj_sy, proj_rx, proj_ry) - r.radius
-        if proj_dist < 150:
-            proj_prox = max(0.0, 1.0 - proj_dist / 150.0)
-            proj_prox *= proj_prox
-            total_danger += proj_prox * (r.radius / 30.0) * 0.6  # weighted less than current
+        # Closest-point-of-approach (CPA): the minimum distance this rock
+        # will reach over the next CPA_HORIZON frames, assuming linear motion.
+        # This catches blindside threats regardless of WHEN they arrive.
+        rel_speed_sq = rel_vx * rel_vx + rel_vy * rel_vy
+        if rel_speed_sq > 0.001:
+            # Time of closest approach (in frames)
+            t_cpa = -(dx_to * rel_vx + dy_to * rel_vy) / rel_speed_sq
+            t_cpa = max(0.0, min(t_cpa, CPA_HORIZON))
+            # Position at closest approach
+            cpa_dx = dx_to + rel_vx * t_cpa
+            cpa_dy = dy_to + rel_vy * t_cpa
+            cpa_dist = sqrt(cpa_dx * cpa_dx + cpa_dy * cpa_dy) - r.radius
+        else:
+            cpa_dist = edge_dist  # not moving relative to ship
 
-    score -= total_danger * 40.0
+        if cpa_dist < 200:
+            size_mult = r.radius / 30.0
+            if center_dist > 1:
+                aim_dot = (fwd_x * dx_to + fwd_y * dy_to) / center_dist
+            else:
+                aim_dot = 1.0
+            blindside_mult = 1.0 if aim_dot > 0.3 else (1.8 - aim_dot)
+            # Near-miss: use hyperbolic penalty so CPA ≈ 0 is catastrophic
+            # and even CPA = 80 is clearly dangerous.  Quadratic was too weak.
+            cpa_penalty = size_mult * blindside_mult / (cpa_dist + 8.0)
+            total_danger += cpa_penalty
+
+    # Scale chosen so CPA=0 big rock → ~6.25, CPA=80 → ~0.56
+    # Multiplied by 80 gives 500 / 45 respectively -- very strong signal.
+    score -= total_danger * 80.0
 
     # Bonus for safe distance
     score += min(min_edge_dist, 300) * 0.15
@@ -383,47 +400,78 @@ def static_eval(state):
                 # Children will spawn at the rock's position
                 score -= 40.0 * (1.0 - edist / 130.0)
 
-    # -- Bullets in flight heading toward rocks (still reward good aim) --
+    # -- Bullets in flight: use CPA to check if they'll actually hit --
     for b in state.bullets:
         if b.dist_left <= 0:
             continue
         for r, dx_to_r, dy_to_r, cdist_r, edist_r, closing_r in rock_info:
             bdx = wrap_delta(b.x, r.x, winWidth)
             bdy = wrap_delta(b.y, r.y, winHeight)
-            bd = sqrt(bdx * bdx + bdy * bdy)
-            if bd < 1:
-                score += 15.0
+            # Bullet-rock relative velocity (bullet moves, rock moves)
+            brvx = (b.dx - r.dx) * SIM_DT
+            brvy = (b.dy - r.dy) * SIM_DT
+            br_speed_sq = brvx * brvx + brvy * brvy
+            if br_speed_sq < 0.001:
                 continue
-            dot = (b.dx * bdx + b.dy * bdy) / (b.speed * bd) if b.speed > 0 else 0
-            if dot > 0.85 and bd < 350:
-                # More reward if targeting a safe rock (small, or far from ship)
+            t_hit = (bdx * brvx + bdy * brvy) / br_speed_sq
+            if t_hit < 0:
+                continue  # bullet moving away from rock
+            cpa_bx = bdx - brvx * t_hit
+            cpa_by = bdy - brvy * t_hit
+            miss_dist = sqrt(cpa_bx * cpa_bx + cpa_by * cpa_by)
+            if miss_dist < r.radius + 8:
+                # Bullet will hit this rock
                 safe_mult = 1.0
                 if r.radius >= 30 and edist_r < 130:
-                    safe_mult = 0.2  # discourage hitting big rocks near us
-                score += 12.0 * dot * safe_mult
+                    safe_mult = 0.2
+                score += 15.0 * safe_mult
 
-    # -- Aim alignment: reward heading toward incoming targets --
-    # Only reward aiming at rocks that are approaching us (closing > 0).
-    # This encourages "turret" play: rotate to face incoming threats
-    # rather than chasing distant rocks.
-    best_aim = 0.0
+    # -- Aim alignment with lead targeting --
+    # First check if ANY rock is on a collision course.  If so, this is
+    # full evasion mode: suppress all aim bonuses so the eval is purely
+    # about surviving, not about scoring kills.
+    any_collision_course = False
+    bullet_speed = 5.0 * SIM_DT
     for r, dx_to, dy_to, cdist, edist, closing in rock_info:
-        if cdist < 1 or closing < 0:
-            continue  # skip rocks moving away -- they'll come back around
-        nx = dx_to / cdist
-        ny = dy_to / cdist
-        dot = fwd_x * nx + fwd_y * ny  # 1 = pointing right at it
-        if dot > 0.7:
-            aim_val = dot * 6.0
-            # Prefer aiming at rocks that are closer to firing range
-            if edist < 350:
-                aim_val *= 1.3
-            if r.radius < 30:
-                aim_val *= 1.5  # small rocks are safest to kill
-            elif edist < 130:
-                aim_val *= 0.3  # don't aim at close big rocks
-            if aim_val > best_aim:
-                best_aim = aim_val
+        rel_vx = (r.dx - ship.dx) * SIM_DT
+        rel_vy = (r.dy - ship.dy) * SIM_DT
+        rel_speed_sq = rel_vx * rel_vx + rel_vy * rel_vy
+        if rel_speed_sq > 0.001:
+            t_cpa = -(dx_to * rel_vx + dy_to * rel_vy) / rel_speed_sq
+            t_cpa = max(0.0, min(t_cpa, 60.0))
+            cpa_dx = dx_to + rel_vx * t_cpa
+            cpa_dy = dy_to + rel_vy * t_cpa
+            cpa_dist = sqrt(cpa_dx * cpa_dx + cpa_dy * cpa_dy) - r.radius
+            if cpa_dist < 80:
+                any_collision_course = True
+                break
+
+    best_aim = 0.0
+    if not any_collision_course:
+        for r, dx_to, dy_to, cdist, edist, closing in rock_info:
+            if cdist < 1 or closing < 0:
+                continue  # skip rocks moving away
+
+            # Lead target: where will the rock be when a bullet reaches it?
+            t_flight = cdist / bullet_speed if bullet_speed > 0 else 0
+            lead_x = dx_to + (r.dx - ship.dx) * SIM_DT * t_flight
+            lead_y = dy_to + (r.dy - ship.dy) * SIM_DT * t_flight
+            lead_dist = sqrt(lead_x * lead_x + lead_y * lead_y)
+            if lead_dist < 1:
+                continue
+            lead_nx = lead_x / lead_dist
+            lead_ny = lead_y / lead_dist
+            dot = fwd_x * lead_nx + fwd_y * lead_ny
+            if dot > 0.7:
+                aim_val = dot * 6.0
+                if edist < 350:
+                    aim_val *= 1.3
+                if r.radius < 30:
+                    aim_val *= 1.5
+                elif edist < 130:
+                    aim_val *= 0.3
+                if aim_val > best_aim:
+                    best_aim = aim_val
     score += best_aim
 
     # -- Station-keeping: strongly reward low speed --
@@ -455,21 +503,41 @@ def prune_actions(state):
             return [0, 1, 2, 3, 4, 5]  # include thrust for braking
         return [0]
 
-    # Check if any rock is an immediate threat
+    # Check if any rock is a threat -- by distance OR by closest-approach.
+    # A rock far away but on a collision course is just as dangerous.
     speed = sqrt(ship.dx ** 2 + ship.dy ** 2)
-    nearest_edge = float('inf')
+    danger = False
     for r in state.rocks:
-        d = torus_dist(ship.x, ship.y, r.x, r.y) - r.radius
-        if d < nearest_edge:
-            nearest_edge = d
+        dx_to = wrap_delta(ship.x, r.x, winWidth)
+        dy_to = wrap_delta(ship.y, r.y, winHeight)
+        center_dist = sqrt(dx_to * dx_to + dy_to * dy_to)
+        edge_dist = center_dist - r.radius
 
-    if nearest_edge < 120 or speed > 2.0:
-        # In danger or moving too fast: full movement set for dodging/braking
+        # Close by distance -- obvious danger
+        if edge_dist < 120:
+            danger = True
+            break
+
+        # Closest-point-of-approach within the next ~60 frames
+        rel_vx = (r.dx - ship.dx) * SIM_DT
+        rel_vy = (r.dy - ship.dy) * SIM_DT
+        rel_speed_sq = rel_vx * rel_vx + rel_vy * rel_vy
+        if rel_speed_sq > 0.001:
+            t_cpa = -(dx_to * rel_vx + dy_to * rel_vy) / rel_speed_sq
+            t_cpa = max(0.0, min(t_cpa, 60.0))
+            cpa_dx = dx_to + rel_vx * t_cpa
+            cpa_dy = dy_to + rel_vy * t_cpa
+            cpa_dist = sqrt(cpa_dx * cpa_dx + cpa_dy * cpa_dy) - r.radius
+            # If rock will pass within 90px, we need dodge options
+            if cpa_dist < 90:
+                danger = True
+                break
+
+    if danger or speed > 2.0:
+        # Full movement set for dodging/braking
         actions = [0, 1, 2, 3, 4, 5]
     else:
-        # Safe: prefer station-keeping -- rotate and drift, thrust only rarely.
-        # Keeping thrust available lets MCTS use it if truly needed,
-        # but the smaller action set steers search toward turning + waiting.
+        # Safe: station-keeping -- rotate and drift
         actions = [0, 2, 3]  # drift, turn-left, turn-right
         if speed > 1.0:
             actions.append(1)  # thrust for braking
