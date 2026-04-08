@@ -263,6 +263,11 @@ class GameState:
 # Static evaluation (replaces expensive rollouts)
 # ---------------------------------------------------------------------------
 
+_SIN8 = [sin(i * pi / 4) for i in range(8)]
+_COS8 = [cos(i * pi / 4) for i in range(8)]
+LOOKAHEAD_FRAMES = 20  # project rock positions forward this many frames
+
+
 def static_eval(state):
     """Evaluate a game state cheaply. Higher = better for the agent."""
     if not state.alive:
@@ -271,62 +276,155 @@ def static_eval(state):
     ship = state.ship
     score = 0.0
 
-    # Credit for kills so far
+    # Credit for kills
     score += state.rocks_killed * 50.0
 
     if not state.rocks:
-        return score + 200.0   # wave cleared -- great
+        return score + 200.0   # wave cleared
 
-    # -- Danger assessment: every rock contributes --
+    fwd_x = -sin(ship.theta * pi / 180)
+    fwd_y = -cos(ship.theta * pi / 180)
+
+    # -- Danger from current AND projected rock positions --
     min_edge_dist = float('inf')
     total_danger = 0.0
+    rock_info = []  # cache for reuse below
+
     for r in state.rocks:
-        edge_dist = torus_dist(ship.x, ship.y, r.x, r.y) - r.radius
+        dx_to = wrap_delta(ship.x, r.x, winWidth)
+        dy_to = wrap_delta(ship.y, r.y, winHeight)
+        center_dist = sqrt(dx_to * dx_to + dy_to * dy_to)
+        edge_dist = center_dist - r.radius
+
+        # Relative velocity
+        rel_vx = r.dx - ship.dx
+        rel_vy = r.dy - ship.dy
+        closing = (dx_to * rel_vx + dy_to * rel_vy) / max(1.0, center_dist)
+
+        rock_info.append((r, dx_to, dy_to, center_dist, edge_dist, closing))
+
         if edge_dist < min_edge_dist:
             min_edge_dist = edge_dist
 
+        # Danger from CURRENT position
         if edge_dist < 250:
-            dx_to = wrap_delta(ship.x, r.x, winWidth)
-            dy_to = wrap_delta(ship.y, r.y, winHeight)
-            d = max(1.0, sqrt(dx_to * dx_to + dy_to * dy_to))
-            # Closing speed (positive = approaching)
-            rel_vx = r.dx - ship.dx
-            rel_vy = r.dy - ship.dy
-            closing = (dx_to * rel_vx + dy_to * rel_vy) / d
             proximity = max(0.0, 1.0 - edge_dist / 250.0)
-            # Scale sharply at close range
-            proximity = proximity * proximity
+            proximity *= proximity
             speed_mult = 1.0 + max(0.0, closing) * 0.8
-            # Larger rocks = bigger collision zone = more dangerous
             size_mult = r.radius / 30.0
             total_danger += proximity * speed_mult * size_mult
 
-    # Heavy penalty for danger; this is the primary survival signal
+        # Danger from PROJECTED position (where the rock will be in ~20 frames)
+        # This gives early warning for incoming threats
+        proj_rx = (r.x + r.dx * SIM_DT * LOOKAHEAD_FRAMES) % winWidth
+        proj_ry = (r.y + r.dy * SIM_DT * LOOKAHEAD_FRAMES) % winHeight
+        proj_sx = (ship.x + ship.dx * SIM_DT * LOOKAHEAD_FRAMES) % winWidth
+        proj_sy = (ship.y + ship.dy * SIM_DT * LOOKAHEAD_FRAMES) % winHeight
+        proj_dist = torus_dist(proj_sx, proj_sy, proj_rx, proj_ry) - r.radius
+        if proj_dist < 150:
+            proj_prox = max(0.0, 1.0 - proj_dist / 150.0)
+            proj_prox *= proj_prox
+            total_danger += proj_prox * (r.radius / 30.0) * 0.6  # weighted less than current
+
     score -= total_danger * 40.0
 
-    # Bonus for maintaining safe distance
+    # Bonus for safe distance
     score += min(min_edge_dist, 300) * 0.15
 
-    # Speed penalty: can't dodge when moving fast
-    speed = sqrt(ship.dx ** 2 + ship.dy ** 2)
-    if speed > 2.5:
-        score -= (speed - 2.5) ** 2 * 2.0
+    # -- Escape corridor scoring --
+    # Cast 8 rays from the ship; measure clearance in each direction.
+    # If most directions are blocked, the ship is cornered.
+    corridor_dists = []
+    for i in range(8):
+        ray_dx, ray_dy = _SIN8[i], _COS8[i]
+        min_clear = 400.0  # max check distance
+        for r, dx_to, dy_to, cdist, edist, closing in rock_info:
+            # Project ship position along ray, find closest approach to rock
+            # Using dot product: t = projection of rock-offset onto ray
+            t = dx_to * ray_dx + dy_to * ray_dy
+            if t < 0:
+                continue  # rock is behind this ray
+            # Perpendicular distance from rock center to ray
+            perp = abs(dx_to * ray_dy - dy_to * ray_dx)
+            if perp < r.radius + SHIP_RADIUS:
+                # Ray hits this rock's collision zone
+                clear = max(0.0, t - r.radius - SHIP_RADIUS)
+                if clear < min_clear:
+                    min_clear = clear
+        corridor_dists.append(min_clear)
 
-    # Bullets heading toward rocks: reward accurate shots in flight
+    corridor_dists.sort()
+    # The best escape corridor: how far can we go in the most open direction?
+    best_escape = corridor_dists[-1]
+    second_escape = corridor_dists[-2] if len(corridor_dists) > 1 else 0
+    # Penalize being surrounded: fewer/shorter escape routes = worse
+    if best_escape < 100:
+        score -= 60.0  # severely cornered
+    elif best_escape < 200:
+        score -= 25.0 * (1.0 - best_escape / 200.0)
+    # Bonus for having multiple open corridors
+    score += min(second_escape, 200) * 0.05
+
+    # -- Close-range kill danger --
+    # If a bullet is about to hit a big/medium rock near the ship,
+    # the children spawn right there -- this is dangerous, not good.
     for b in state.bullets:
         if b.dist_left <= 0:
             continue
-        for r in state.rocks:
+        for r, dx_to, dy_to, cdist, edist, closing in rock_info:
+            if r.radius < 30:
+                continue  # small rocks don't spawn children
+            # Is this bullet about to hit this rock?
+            bdx = wrap_delta(b.x, r.x, winWidth)
+            bdy = wrap_delta(b.y, r.y, winHeight)
+            bd = sqrt(bdx * bdx + bdy * bdy)
+            if bd < r.radius + 20 and edist < 130:
+                # Bullet about to destroy a big/medium rock near us
+                # Children will spawn at the rock's position
+                score -= 40.0 * (1.0 - edist / 130.0)
+
+    # -- Bullets in flight heading toward rocks (still reward good aim) --
+    for b in state.bullets:
+        if b.dist_left <= 0:
+            continue
+        for r, dx_to_r, dy_to_r, cdist_r, edist_r, closing_r in rock_info:
             bdx = wrap_delta(b.x, r.x, winWidth)
             bdy = wrap_delta(b.y, r.y, winHeight)
             bd = sqrt(bdx * bdx + bdy * bdy)
             if bd < 1:
                 score += 15.0
                 continue
-            # Dot product of bullet velocity with direction to rock
             dot = (b.dx * bdx + b.dy * bdy) / (b.speed * bd) if b.speed > 0 else 0
-            if dot > 0.9 and bd < 300:
-                score += 10.0 * dot  # bullet is on target
+            if dot > 0.85 and bd < 350:
+                # More reward if targeting a safe rock (small, or far from ship)
+                safe_mult = 1.0
+                if r.radius >= 30 and edist_r < 130:
+                    safe_mult = 0.2  # discourage hitting big rocks near us
+                score += 12.0 * dot * safe_mult
+
+    # -- Aim alignment: reward heading toward a good target --
+    best_aim = 0.0
+    for r, dx_to, dy_to, cdist, edist, closing in rock_info:
+        if cdist < 1:
+            continue
+        nx = dx_to / cdist
+        ny = dy_to / cdist
+        dot = fwd_x * nx + fwd_y * ny  # 1 = pointing right at it
+        if dot > 0.7:
+            # Prefer aiming at small rocks (safe to kill) or distant big rocks
+            aim_val = dot * 5.0
+            if r.radius < 30:
+                aim_val *= 1.5  # small rocks are safe targets
+            elif edist < 130:
+                aim_val *= 0.3  # don't aim at close big rocks
+            if aim_val > best_aim:
+                best_aim = aim_val
+    score += best_aim
+
+    # -- Speed management --
+    speed = sqrt(ship.dx ** 2 + ship.dy ** 2)
+    if speed > 2.5:
+        score -= (speed - 2.5) ** 2 * 2.0
 
     return score
 
@@ -341,18 +439,37 @@ def prune_actions(state):
     ship = state.ship
 
     if not state.rocks:
-        # No rocks: drift, or brake if moving fast
         speed = sqrt(ship.dx ** 2 + ship.dy ** 2)
         if speed > 1.5:
-            return [0, 1, 2, 3, 4, 5]  # all movement actions to find braking
-        return [0]  # just drift
+            return [0, 1, 2, 3, 4, 5]
+        return [0]
 
-    # Always consider: drift, thrust, turn-left, turn-right, thrust+left, thrust+right
+    # Always consider movement
     actions = [0, 1, 2, 3, 4, 5]
 
     if can_shoot:
-        # Add shoot combos
-        actions.extend([6, 7, 8, 9])
+        # Check if we're aimed at a big/medium rock that's close --
+        # shooting it would spawn children right on top of us.
+        fwd_x = -sin(ship.theta * pi / 180)
+        fwd_y = -cos(ship.theta * pi / 180)
+        suppress_shoot = False
+        for r in state.rocks:
+            if r.radius < 30:
+                continue  # small rocks are always safe to shoot
+            dx_to = wrap_delta(ship.x, r.x, winWidth)
+            dy_to = wrap_delta(ship.y, r.y, winHeight)
+            d = sqrt(dx_to * dx_to + dy_to * dy_to)
+            if d < 1:
+                continue
+            dot = (fwd_x * dx_to + fwd_y * dy_to) / d
+            edge_dist = d - r.radius
+            # If we're aimed at a close big/medium rock, don't shoot
+            if dot > 0.85 and edge_dist < 100:
+                suppress_shoot = True
+                break
+
+        if not suppress_shoot:
+            actions.extend([6, 7, 8, 9])
 
     return actions
 
@@ -415,7 +532,7 @@ class MCTSNode:
             node = node.parent
 
 
-def mcts_search(root_state, budget_sec=0.008):
+def mcts_search(root_state, budget_sec=0.010):
     """Time-budgeted MCTS. Returns best action index."""
     root = MCTSNode(root_state.copy())
     deadline = time.monotonic() + budget_sec
@@ -505,7 +622,7 @@ def build_sim_state(ship, rocks, bullets):
 # Watch mode
 # ---------------------------------------------------------------------------
 
-def watch(budget_ms=8, fast=False):
+def watch(budget_ms=10, fast=False):
     import pygame
     from pygame.locals import QUIT, KEYUP, K_q
     import asteroids as _astro
@@ -619,8 +736,8 @@ def watch(budget_ms=8, fast=False):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MCTS agent for Asteroids")
-    parser.add_argument("--budget-ms", type=int, default=8,
-                        help="Time budget per MCTS decision in ms (default: 8)")
+    parser.add_argument("--budget-ms", type=int, default=10,
+                        help="Time budget per MCTS decision in ms (default: 10)")
     parser.add_argument("--fast", action="store_true",
                         help="Run without FPS cap")
     args = parser.parse_args()
