@@ -299,6 +299,9 @@ def static_eval(state):
         # Relative velocity (rock motion in ship's frame)
         rel_vx = (r.dx - ship.dx) * SIM_DT
         rel_vy = (r.dy - ship.dy) * SIM_DT
+        # closing: dot product of (ship→rock) with relative velocity.
+        # NEGATIVE means approaching (rel_v opposes the ship→rock vector).
+        # POSITIVE means receding.
         closing = (dx_to * rel_vx + dy_to * rel_vy) / max(1.0, center_dist)
 
         rock_info.append((r, dx_to, dy_to, center_dist, edge_dist, closing))
@@ -310,7 +313,7 @@ def static_eval(state):
         if edge_dist < 250:
             proximity = max(0.0, 1.0 - edge_dist / 250.0)
             proximity *= proximity
-            speed_mult = 1.0 + max(0.0, closing) * 0.8
+            speed_mult = 1.0 + max(0.0, -closing) * 0.8  # -closing > 0 when approaching
             size_mult = r.radius / 30.0
             total_danger += proximity * speed_mult * size_mult
 
@@ -449,8 +452,8 @@ def static_eval(state):
     best_aim = 0.0
     if not any_collision_course:
         for r, dx_to, dy_to, cdist, edist, closing in rock_info:
-            if cdist < 1 or closing < 0:
-                continue  # skip rocks moving away
+            if cdist < 1 or closing > 0:
+                continue  # skip rocks moving away (closing > 0 = receding)
 
             # Lead target: where will the rock be when a bullet reaches it?
             t_flight = cdist / bullet_speed if bullet_speed > 0 else 0
