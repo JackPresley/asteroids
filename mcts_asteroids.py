@@ -280,10 +280,27 @@ def static_eval(state):
     score += state.rocks_killed * 50.0
 
     if not state.rocks:
-        return score + 200.0   # wave cleared
+        # Wave cleared: brake to a stop, drift to center, arrive ready.
+        cx = winWidth / 2
+        cy = winHeight / 2
+        center_dist = sqrt((ship.x - cx) ** 2 + (ship.y - cy) ** 2)
+        center_bonus = 80.0 * max(0.0, 1.0 - center_dist / (min(winWidth, winHeight) / 2))
+        speed = sqrt(ship.dx ** 2 + ship.dy ** 2)
+        speed_penalty = max(0.0, speed - 1.0) ** 2 * 8.0
+        # Brake-alignment: reward facing anti-velocity so MCTS finds turn+thrust.
+        # Flat coefficient (not speed-proportional) so reducing speed doesn't
+        # decrease the bonus -- the speed_penalty/station_bonus handle that.
+        fwd_x = -sin(ship.theta * pi / 180)
+        fwd_y = -cos(ship.theta * pi / 180)
+        brake_bonus = 0.0
+        if speed > 0.8:
+            brake_dot = -(fwd_x * ship.dx + fwd_y * ship.dy) / speed
+            brake_bonus = max(0.0, brake_dot) * 8.0
+        return score + 200.0 + center_bonus - speed_penalty + brake_bonus
 
     fwd_x = -sin(ship.theta * pi / 180)
     fwd_y = -cos(ship.theta * pi / 180)
+    speed = sqrt(ship.dx ** 2 + ship.dy ** 2)
 
     # -- Danger from current position AND closest-point-of-approach --
     min_edge_dist = float('inf')
@@ -304,7 +321,20 @@ def static_eval(state):
         # POSITIVE means receding.
         closing = (dx_to * rel_vx + dy_to * rel_vy) / max(1.0, center_dist)
 
-        rock_info.append((r, dx_to, dy_to, center_dist, edge_dist, closing))
+        # CPA: compute before appending so t_cpa and cpa_dist are available
+        rel_speed_sq = rel_vx * rel_vx + rel_vy * rel_vy
+        if rel_speed_sq > 0.001:
+            t_cpa = -(dx_to * rel_vx + dy_to * rel_vy) / rel_speed_sq
+            t_cpa = max(0.0, min(t_cpa, CPA_HORIZON))
+            cpa_dx = dx_to + rel_vx * t_cpa
+            cpa_dy = dy_to + rel_vy * t_cpa
+            cpa_dist = sqrt(cpa_dx * cpa_dx + cpa_dy * cpa_dy) - r.radius
+        else:
+            t_cpa = CPA_HORIZON
+            cpa_dist = edge_dist
+
+        rock_info.append((r, dx_to, dy_to, center_dist, edge_dist, closing,
+                          t_cpa, cpa_dist))
 
         if edge_dist < min_edge_dist:
             min_edge_dist = edge_dist
@@ -313,25 +343,12 @@ def static_eval(state):
         if edge_dist < 250:
             proximity = max(0.0, 1.0 - edge_dist / 250.0)
             proximity *= proximity
-            speed_mult = 1.0 + max(0.0, -closing) * 0.8  # -closing > 0 when approaching
+            speed_mult = 1.0 + max(0.0, -closing) * 0.8
             size_mult = r.radius / 30.0
             total_danger += proximity * speed_mult * size_mult
 
-        # Closest-point-of-approach (CPA): the minimum distance this rock
-        # will reach over the next CPA_HORIZON frames, assuming linear motion.
-        # This catches blindside threats regardless of WHEN they arrive.
-        rel_speed_sq = rel_vx * rel_vx + rel_vy * rel_vy
-        if rel_speed_sq > 0.001:
-            # Time of closest approach (in frames)
-            t_cpa = -(dx_to * rel_vx + dy_to * rel_vy) / rel_speed_sq
-            t_cpa = max(0.0, min(t_cpa, CPA_HORIZON))
-            # Position at closest approach
-            cpa_dx = dx_to + rel_vx * t_cpa
-            cpa_dy = dy_to + rel_vy * t_cpa
-            cpa_dist = sqrt(cpa_dx * cpa_dx + cpa_dy * cpa_dy) - r.radius
-        else:
-            cpa_dist = edge_dist  # not moving relative to ship
-
+        # CPA danger: hyperbolic on distance, boosted when arrival is imminent.
+        # t_cpa is in frames; rocks arriving within ~20 frames get a 2× boost.
         if cpa_dist < 200:
             size_mult = r.radius / 30.0
             if center_dist > 1:
@@ -339,26 +356,27 @@ def static_eval(state):
             else:
                 aim_dot = 1.0
             blindside_mult = 1.0 if aim_dot > 0.3 else (1.8 - aim_dot)
-            # Near-miss: use hyperbolic penalty so CPA ≈ 0 is catastrophic
-            # and even CPA = 80 is clearly dangerous.  Quadratic was too weak.
-            cpa_penalty = size_mult * blindside_mult / (cpa_dist + 8.0)
+            urgency = 1.0 + max(0.0, 1.0 - t_cpa / 20.0)  # up to 2× for imminent
+            cpa_penalty = size_mult * blindside_mult * urgency / (cpa_dist + 8.0)
             total_danger += cpa_penalty
 
-    # Scale chosen so CPA=0 big rock → ~6.25, CPA=80 → ~0.56
-    # Multiplied by 80 gives 500 / 45 respectively -- very strong signal.
     score -= total_danger * 80.0
 
-    # Bonus for safe distance
-    score += min(min_edge_dist, 300) * 0.15
+    # Positive baseline: rewards safe distance, gives MCTS a clear contrast
+    # between genuinely safe states (+high) and dangerous ones (-high).
+    score += min(min_edge_dist, 300) * 0.08
 
     # -- Escape corridor scoring --
     # Cast 8 rays from the ship; measure clearance in each direction.
-    # If most directions are blocked, the ship is cornered.
+    # Also track the direction of the most open corridor for use below.
     corridor_dists = []
+    best_corridor_dx = 1.0
+    best_corridor_dy = 0.0
+    best_corridor_raw = 0.0
     for i in range(8):
         ray_dx, ray_dy = _SIN8[i], _COS8[i]
         min_clear = 400.0  # max check distance
-        for r, dx_to, dy_to, cdist, edist, closing in rock_info:
+        for r, dx_to, dy_to, cdist, edist, closing, t_cpa, cpa_dist in rock_info:
             # Project ship position along ray, find closest approach to rock
             # Using dot product: t = projection of rock-offset onto ray
             t = dx_to * ray_dx + dy_to * ray_dy
@@ -372,6 +390,10 @@ def static_eval(state):
                 if clear < min_clear:
                     min_clear = clear
         corridor_dists.append(min_clear)
+        if min_clear > best_corridor_raw:
+            best_corridor_raw = min_clear
+            best_corridor_dx = ray_dx
+            best_corridor_dy = ray_dy
 
     corridor_dists.sort()
     # The best escape corridor: how far can we go in the most open direction?
@@ -385,13 +407,14 @@ def static_eval(state):
     # Bonus for having multiple open corridors
     score += min(second_escape, 200) * 0.05
 
+
     # -- Close-range kill danger --
     # If a bullet is about to hit a big/medium rock near the ship,
     # the children spawn right there -- this is dangerous, not good.
     for b in state.bullets:
         if b.dist_left <= 0:
             continue
-        for r, dx_to, dy_to, cdist, edist, closing in rock_info:
+        for r, dx_to, dy_to, cdist, edist, closing, t_cpa, cpa_dist in rock_info:
             if r.radius < 30:
                 continue  # small rocks don't spawn children
             # Is this bullet about to hit this rock?
@@ -407,7 +430,7 @@ def static_eval(state):
     for b in state.bullets:
         if b.dist_left <= 0:
             continue
-        for r, dx_to_r, dy_to_r, cdist_r, edist_r, closing_r in rock_info:
+        for r, dx_to_r, dy_to_r, cdist_r, edist_r, closing_r, t_cpa_r, cpa_dist_r in rock_info:
             bdx = wrap_delta(b.x, r.x, winWidth)
             bdy = wrap_delta(b.y, r.y, winHeight)
             # Bullet-rock relative velocity (bullet moves, rock moves)
@@ -433,25 +456,26 @@ def static_eval(state):
     # First check if ANY rock is on a collision course.  If so, this is
     # full evasion mode: suppress all aim bonuses so the eval is purely
     # about surviving, not about scoring kills.
-    any_collision_course = False
+    # Use already-computed cpa_dist from rock_info (no recomputation needed).
+    # Threshold raised to 120: aim suppressed earlier, station bonus also tied to this.
+    any_collision_course = any(cpa_dist < 120
+                               for _, _, _, _, _, _, _, cpa_dist in rock_info)
+
+    # Suppress aim if on collision course, OR if last rock remains and we
+    # haven't yet centered and slowed -- force positioning before the kill.
+    suppress_aim = any_collision_course
+    if len(state.rocks) == 1:
+        cx_end = winWidth / 2
+        cy_end = winHeight / 2
+        end_dist = sqrt((ship.x - cx_end) ** 2 + (ship.y - cy_end) ** 2)
+        if end_dist > 110 or speed > 0.3:
+            suppress_aim = True
+
     bullet_speed = 5.0 * SIM_DT
-    for r, dx_to, dy_to, cdist, edist, closing in rock_info:
-        rel_vx = (r.dx - ship.dx) * SIM_DT
-        rel_vy = (r.dy - ship.dy) * SIM_DT
-        rel_speed_sq = rel_vx * rel_vx + rel_vy * rel_vy
-        if rel_speed_sq > 0.001:
-            t_cpa = -(dx_to * rel_vx + dy_to * rel_vy) / rel_speed_sq
-            t_cpa = max(0.0, min(t_cpa, 60.0))
-            cpa_dx = dx_to + rel_vx * t_cpa
-            cpa_dy = dy_to + rel_vy * t_cpa
-            cpa_dist = sqrt(cpa_dx * cpa_dx + cpa_dy * cpa_dy) - r.radius
-            if cpa_dist < 80:
-                any_collision_course = True
-                break
 
     best_aim = 0.0
-    if not any_collision_course:
-        for r, dx_to, dy_to, cdist, edist, closing in rock_info:
+    if not suppress_aim:
+        for r, dx_to, dy_to, cdist, edist, closing, t_cpa, cpa_dist in rock_info:
             if cdist < 1 or closing > 0:
                 continue  # skip rocks moving away (closing > 0 = receding)
 
@@ -477,16 +501,60 @@ def static_eval(state):
                     best_aim = aim_val
     score += best_aim
 
-    # -- Station-keeping: strongly reward low speed --
-    # On a torus every rock comes back; chasing is pure risk.
-    # Being slow means more reaction time and tighter dodge radius.
-    speed = sqrt(ship.dx ** 2 + ship.dy ** 2)
-    if speed < 0.5:
-        score += 15.0          # nearly stationary -- ideal
-    elif speed < 1.5:
-        score += 8.0 * (1.5 - speed)  # gentle reward for being slow
+    # -- Center tendency (only when wave is nearly over) --
+    # With many rocks, survival is paramount and any center pull risks drawing
+    # the ship toward rocks. Only activate for the last two rocks.
+    cx = winWidth / 2
+    cy = winHeight / 2
+    cdx_c = ship.x - cx
+    cdy_c = ship.y - cy
+    center_dist_c = sqrt(cdx_c * cdx_c + cdy_c * cdy_c)
+    max_r = min(winWidth, winHeight) / 2
+    n_rocks = len(state.rocks)
+    if n_rocks == 2:
+        center_weight = 12.0
+    elif n_rocks == 1:
+        center_weight = 26.0
     else:
-        score -= (speed - 1.5) ** 2 * 4.0  # escalating penalty
+        center_weight = 0.0
+    if center_weight > 0.0:
+        score += center_weight * max(0.0, 1.0 - center_dist_c / max_r)
+
+    # With 1 rock left: guide the ship to the center vicinity, THEN stop.
+    # Speed penalty scales with proximity -- mild when far (we need some speed
+    # to reach center), full when already near center (must stop there).
+    # A velocity-toward-center bonus gives MCTS an immediate shallow gradient
+    # so it discovers "thrust toward center" rather than "stop wherever I am."
+    if n_rocks == 1:
+        center_fraction = min(1.0, center_dist_c / max_r)  # 0=at center, 1=at edge
+        score -= speed * speed * 18.0 * (0.15 + 0.85 * (1.0 - center_fraction))
+        if center_dist_c > 30 and speed > 0.1:
+            to_cx = -cdx_c / center_dist_c
+            to_cy = -cdy_c / center_dist_c
+            vel_dot_center = (ship.dx * to_cx + ship.dy * to_cy) / speed
+            score += max(0.0, vel_dot_center) * center_fraction * 30.0
+
+    # -- Speed management --
+    # (speed already computed above)
+
+    # Station-keeping bonus when slow (positive baseline for MCTS contrast)
+    if speed < 0.5:
+        score += 15.0
+    elif speed < 1.5:
+        score += 8.0 * (1.5 - speed)
+
+    # Penalise excess speed -- scaled by rock count so that moving fast through
+    # a crowded field is much more costly than moving fast near one rock.
+    if speed > 1.5:
+        rock_count_mult = 1.0 + min(len(state.rocks), 8) * 0.3
+        score -= (speed - 1.5) ** 2 * 4.0 * rock_count_mult
+
+    # Brake-alignment bonus: reward heading aimed opposite to current velocity.
+    # Flat coefficient (not speed-proportional) so reducing speed doesn't
+    # decrease the bonus -- the speed_penalty/station_bonus handle that incentive.
+    if speed > 0.8:
+        brake_dot = -(fwd_x * ship.dx + fwd_y * ship.dy) / speed
+        score += max(0.0, brake_dot) * 8.0
 
     return score
 
@@ -501,15 +569,14 @@ def prune_actions(state):
     ship = state.ship
 
     if not state.rocks:
-        speed = sqrt(ship.dx ** 2 + ship.dy ** 2)
-        if speed > 1.0:
-            return [0, 1, 2, 3, 4, 5]  # include thrust for braking
+        # Wave cleared -- do nothing until next wave spawns.
         return [0]
 
     # Check if any rock is a threat -- by distance OR by closest-approach.
     # A rock far away but on a collision course is just as dangerous.
     speed = sqrt(ship.dx ** 2 + ship.dy ** 2)
     danger = False
+    shoot_threat = False   # imminent hit -- suppress shooting, evasion only
     for r in state.rocks:
         dx_to = wrap_delta(ship.x, r.x, winWidth)
         dy_to = wrap_delta(ship.y, r.y, winHeight)
@@ -519,7 +586,8 @@ def prune_actions(state):
         # Close by distance -- obvious danger
         if edge_dist < 120:
             danger = True
-            break
+        if edge_dist < 75:
+            shoot_threat = True
 
         # Closest-point-of-approach within the next ~60 frames
         rel_vx = (r.dx - ship.dx) * SIM_DT
@@ -534,7 +602,12 @@ def prune_actions(state):
             # If rock will pass within 90px, we need dodge options
             if cpa_dist < 90:
                 danger = True
-                break
+            # Truly imminent: suppress shooting so MCTS focuses on evasion
+            if cpa_dist < 55 and t_cpa < 30:
+                shoot_threat = True
+
+        if danger and shoot_threat:
+            break  # found both, no need to continue
 
     if danger or speed > 2.0:
         # Full movement set for dodging/braking
@@ -544,6 +617,46 @@ def prune_actions(state):
         actions = [0, 2, 3]  # drift, turn-left, turn-right
         if speed > 1.0:
             actions.append(1)  # thrust for braking
+        # With 1 rock left the ship must thrust to reach center even when slow
+        if len(state.rocks) == 1 and 1 not in actions:
+            actions.append(1)
+
+    # Last rock: block shooting until the ship is centered and nearly stopped.
+    # Use a tight imminent-collision check (not the broad `danger` flag) so
+    # that the rock being "nearby" doesn't trigger the exception -- only a
+    # direct unavoidable hit does.
+    if len(state.rocks) == 1 and can_shoot:
+        cx_end = winWidth / 2
+        cy_end = winHeight / 2
+        dx_c = ship.x - cx_end
+        dy_c = ship.y - cy_end
+        not_positioned = sqrt(dx_c * dx_c + dy_c * dy_c) > 110 or speed > 0.3
+        if not_positioned:
+            # Only allow shooting if rock is about to hit (true emergency)
+            imminent = False
+            r_last = state.rocks[0]
+            lx = wrap_delta(ship.x, r_last.x, winWidth)
+            ly = wrap_delta(ship.y, r_last.y, winHeight)
+            edge_last = sqrt(lx * lx + ly * ly) - r_last.radius
+            if edge_last < 55:
+                imminent = True
+            else:
+                rvx = (r_last.dx - ship.dx) * SIM_DT
+                rvy = (r_last.dy - ship.dy) * SIM_DT
+                rsq = rvx * rvx + rvy * rvy
+                if rsq > 0.001:
+                    tc = max(0.0, min(-(lx * rvx + ly * rvy) / rsq, 60.0))
+                    cdx2 = lx + rvx * tc
+                    cdy2 = ly + rvy * tc
+                    if sqrt(cdx2 * cdx2 + cdy2 * cdy2) - r_last.radius < 45:
+                        imminent = True
+            if not imminent:
+                can_shoot = False
+
+    # Imminent collision: evasion takes absolute priority over shooting.
+    # Removing shoot actions forces MCTS to search only evasive moves.
+    if shoot_threat:
+        can_shoot = False
 
     if can_shoot:
         # Check if we're aimed at a big/medium rock that's close --
@@ -756,6 +869,8 @@ def watch(budget_ms=10, fast=False):
     frame_count = 0
     current_action = ACTIONS[0]
     budget_sec = budget_ms / 1000.0
+    wave_cleared_frames = 0          # counts down centering phase between waves
+    CENTERING_FRAMES = 120           # ~2 seconds at 60 FPS
 
     while True:
         raw_ms = fpsClock.tick(0 if fast else FPS)
@@ -823,11 +938,17 @@ def watch(budget_ms=10, fast=False):
                  "bottomleft", winWidth / 20, 18 * winHeight / 20, False)
 
         if len(rocks) == 0:
-            num_rocks += 1
-            bullets.empty()
-            pygame.event.clear()
-            while len(rocks) < num_rocks:
-                BigRock(screen, rocks)
+            if wave_cleared_frames == 0:
+                # First frame with no rocks: start centering countdown
+                bullets.empty()
+                pygame.event.clear()
+                wave_cleared_frames = CENTERING_FRAMES
+            wave_cleared_frames -= 1
+            if wave_cleared_frames <= 0:
+                num_rocks += 1
+                while len(rocks) < num_rocks:
+                    BigRock(screen, rocks)
+                wave_cleared_frames = 0
 
         pygame.display.update()
         frame_count += 1
