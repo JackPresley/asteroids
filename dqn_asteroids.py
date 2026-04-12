@@ -196,13 +196,13 @@ N_ACTIONS = len(ACTIONS)
 GAMMA = 0.995
 LR = 1e-4
 BATCH_SIZE = 256
-REPLAY_SIZE = 200_000
+REPLAY_SIZE = 400_000
 TARGET_TAU = 0.01           # Polyak soft-update rate for target network
-GRAD_STEPS_PER_ENV = 1      # gradient updates per environment step
+GRAD_STEPS_PER_ENV = 2      # gradient updates per environment step
 GRAD_CLIP = 1.0             # max gradient norm
 EPS_START = 1.0
 EPS_END = 0.05
-EPS_DECAY = 500_000         # linear decay over this many steps
+EPS_DECAY = 1_000_000       # linear decay over this many steps
 MAX_EPISODE_STEPS = 16000   # ~267 seconds of game time at 60fps
 
 # Prioritized Experience Replay
@@ -383,8 +383,11 @@ class AsteroidsEnv:
             self.rocks.append(SimRock(rock.x, rock.y, dx, dy, child_radius))
 
     def _cpa_danger(self):
-        """Compute total CPA-based danger score (mirrors MCTS static_eval logic)."""
-        total = 0.0
+        """Compute CPA-based danger score: max single-rock threat.
+        Using max rather than sum/N ensures the evasion signal stays constant
+        regardless of rock count — the most dangerous rock always generates full
+        pressure without overwhelming the aim bonus when many rocks are present."""
+        best = 0.0
         ship = self.ship
         for r in self.rocks:
             dx_to = wrap_delta(ship.x, r.x, winWidth)
@@ -407,8 +410,10 @@ class AsteroidsEnv:
                 size_mult = r.radius / 30.0
                 closing = (dx_to * rel_vx + dy_to * rel_vy) / max(1.0, center_dist)
                 speed_mult = 1.0 + max(0.0, -closing) * 0.8
-                total += size_mult * urgency * speed_mult / max(1.0, cpa_dist + 8.0)
-        return total
+                threat = size_mult * urgency * speed_mult / max(1.0, cpa_dist + 8.0)
+                if threat > best:
+                    best = threat
+        return best
 
     def step(self, action_idx):
         """Advance simulation by SIM_STEPS_PER_ACTION frames. Returns (obs, reward, done)."""
@@ -505,7 +510,7 @@ class AsteroidsEnv:
         # Per-step CPA danger penalty: dense signal mirrors MCTS static_eval.
         # Provides gradient on every step, not just at death.
         if self.rocks:
-            reward -= self._cpa_danger() * 0.12 / max(1, len(self.rocks))
+            reward -= self._cpa_danger() * 0.12
 
         done = self.steps >= MAX_EPISODE_STEPS
         obs = build_observation(self.ship, self.rocks, self.bullets, self.shoot_cooldown)
@@ -818,7 +823,7 @@ class DQNAgent:
 # Training loop
 # ---------------------------------------------------------------------------
 
-def train(num_episodes=20000, save_every=100, model_path="dqn_model.pt", clear_buffer=False):
+def train(num_episodes=50000, save_every=100, model_path="dqn_model.pt", clear_buffer=False):
     agent = DQNAgent()
     print(f"Device: {agent.device}")
 
@@ -848,7 +853,7 @@ def train(num_episodes=20000, save_every=100, model_path="dqn_model.pt", clear_b
     # avg100 = 0 means kills roughly offset the death penalty — agent reliably
     # clears most of the first wave. Sufficient bar to practice 2-rock scenarios.
     CURRICULUM_THRESHOLD = 0.0
-    CURRICULUM_MIN_EPS = 300  # don't promote before this many episodes at current level
+    CURRICULUM_MIN_EPS = 700  # don't promote before this many episodes at current level
 
     eps_at_level = 0
 
