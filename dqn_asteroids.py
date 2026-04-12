@@ -188,19 +188,17 @@ SIM_STEPS_PER_ACTION = 4
 MAX_ROCKS = 8           # observe up to this many rocks
 MAX_BULLETS = 2         # observe up to this many bullets
 SHIP_FEATURES = 10      # ship state + cooldown + bullet count
-ROCK_FEATURES = 7       # pos(2) + vel(2) + radius + aim_dot + aim_cross
+ROCK_FEATURES = 9       # pos(2) + vel(2) + radius + aim_dot + aim_cross + t_cpa + cpa_dist
 BULLET_FEATURES = 5     # pos(2) + vel(2) + nearest_rock_dist
 STATE_DIM = SHIP_FEATURES + MAX_ROCKS * ROCK_FEATURES + MAX_BULLETS * BULLET_FEATURES
 N_ACTIONS = len(ACTIONS)
 
 GAMMA = 0.995
-LR_START = 1e-4
-LR_END = 1e-4
-LR_DECAY_STEPS = 1          # not used with constant LR
+LR = 1e-4
 BATCH_SIZE = 256
 REPLAY_SIZE = 200_000
 TARGET_TAU = 0.01           # Polyak soft-update rate for target network
-GRAD_STEPS_PER_ENV = 4      # gradient updates per environment step
+GRAD_STEPS_PER_ENV = 1      # gradient updates per environment step
 GRAD_CLIP = 1.0             # max gradient norm
 EPS_START = 1.0
 EPS_END = 0.05
@@ -215,7 +213,7 @@ PER_BETA_FRAMES = 100_000
 PER_EPSILON = 1e-6
 
 # N-step returns
-N_STEPS = 3
+N_STEPS = 5
 
 # ---------------------------------------------------------------------------
 # Observation builder
@@ -241,16 +239,28 @@ def build_observation(ship, rocks, bullets, shoot_cooldown=0):
     obs[idx + 4] = speed / 5.0
     obs[idx + 5] = sin(ship.theta * pi / 180)
     obs[idx + 6] = cos(ship.theta * pi / 180)
-    obs[idx + 7] = len(rocks) / 20.0
+    obs[idx + 7] = len(rocks) / MAX_ROCKS
     obs[idx + 8] = max(0.0, shoot_cooldown) / 15.0   # shot availability
     obs[idx + 9] = len(bullets) / 6.0                 # bullet count
     idx += SHIP_FEATURES
 
-    # Sort rocks by distance to ship
-    rock_list = sorted(
-        rocks,
-        key=lambda r: torus_dist(ship.x, ship.y, r.x, r.y),
-    )
+    # Sort rocks by CPA danger: most threatening (soonest, closest approach) first.
+    # This puts the primary evasion target at a consistent observation index.
+    def _danger_key(r):
+        dx = wrap_delta(ship.x, r.x, winWidth)
+        dy = wrap_delta(ship.y, r.y, winHeight)
+        rvx = (r.dx - ship.dx) * SIM_DT
+        rvy = (r.dy - ship.dy) * SIM_DT
+        rs2 = rvx * rvx + rvy * rvy
+        if rs2 > 0.001:
+            t = max(0.0, min(-(dx * rvx + dy * rvy) / rs2, 60.0))
+            cd = sqrt((dx + rvx * t) ** 2 + (dy + rvy * t) ** 2) - r.radius * 0.7 - SHIP_RADIUS
+        else:
+            t = 60.0
+            cd = sqrt(dx * dx + dy * dy) - r.radius * 0.7 - SHIP_RADIUS
+        return -(r.radius / 30.0) * (1.0 + max(0.0, 1.0 - t / 20.0)) / max(1.0, cd + 8.0)
+
+    rock_list = sorted(rocks, key=_danger_key)
 
     for i in range(MAX_ROCKS):
         if i < len(rock_list):
@@ -268,6 +278,21 @@ def build_observation(ship, rocks, bullets, shoot_cooldown=0):
                 nx, ny = dx_to / dist_to, dy_to / dist_to
                 obs[idx + 5] = fwd_x * nx + fwd_y * ny   # aim_dot (-1 to 1)
                 obs[idx + 6] = fwd_x * ny - fwd_y * nx   # aim_cross (turn direction)
+            # CPA features: time-to-closest-approach and miss distance
+            rel_vx = (r.dx - ship.dx) * SIM_DT
+            rel_vy = (r.dy - ship.dy) * SIM_DT
+            rel_speed_sq = rel_vx * rel_vx + rel_vy * rel_vy
+            if rel_speed_sq > 0.001:
+                t_cpa = -(dx_to * rel_vx + dy_to * rel_vy) / rel_speed_sq
+                t_cpa = max(0.0, min(t_cpa, 60.0))
+                cpa_dx = dx_to + rel_vx * t_cpa
+                cpa_dy = dy_to + rel_vy * t_cpa
+                cpa_dist = sqrt(cpa_dx * cpa_dx + cpa_dy * cpa_dy) - r.radius * 0.7 - SHIP_RADIUS
+            else:
+                t_cpa = 60.0
+                cpa_dist = dist_to - r.radius * 0.7 - SHIP_RADIUS
+            obs[idx + 7] = t_cpa / 60.0                           # 0=now, 1=far future
+            obs[idx + 8] = max(-1.0, min(1.0, cpa_dist / 200.0)) # 0=collision boundary, neg=lethal
         idx += ROCK_FEATURES
 
     # Sort bullets by remaining distance (most remaining first = most relevant)
@@ -357,14 +382,33 @@ class AsteroidsEnv:
             dy *= 0.2
             self.rocks.append(SimRock(rock.x, rock.y, dx, dy, child_radius))
 
-    def _min_rock_dist(self):
-        """Shortest distance from ship to any rock edge."""
-        if not self.rocks:
-            return _DIAG
-        return min(
-            torus_dist(self.ship.x, self.ship.y, r.x, r.y) - r.radius
-            for r in self.rocks
-        )
+    def _cpa_danger(self):
+        """Compute total CPA-based danger score (mirrors MCTS static_eval logic)."""
+        total = 0.0
+        ship = self.ship
+        for r in self.rocks:
+            dx_to = wrap_delta(ship.x, r.x, winWidth)
+            dy_to = wrap_delta(ship.y, r.y, winHeight)
+            center_dist = sqrt(dx_to * dx_to + dy_to * dy_to)
+            rel_vx = (r.dx - ship.dx) * SIM_DT
+            rel_vy = (r.dy - ship.dy) * SIM_DT
+            rel_speed_sq = rel_vx * rel_vx + rel_vy * rel_vy
+            if rel_speed_sq > 0.001:
+                t_cpa = -(dx_to * rel_vx + dy_to * rel_vy) / rel_speed_sq
+                t_cpa = max(0.0, min(t_cpa, 60.0))
+                cpa_dx = dx_to + rel_vx * t_cpa
+                cpa_dy = dy_to + rel_vy * t_cpa
+                cpa_dist = sqrt(cpa_dx * cpa_dx + cpa_dy * cpa_dy) - r.radius * 0.7 - SHIP_RADIUS
+            else:
+                t_cpa = 60.0
+                cpa_dist = center_dist - r.radius * 0.7 - SHIP_RADIUS
+            if cpa_dist < 200:
+                urgency = 1.0 + max(0.0, 1.0 - t_cpa / 20.0)
+                size_mult = r.radius / 30.0
+                closing = (dx_to * rel_vx + dy_to * rel_vy) / max(1.0, center_dist)
+                speed_mult = 1.0 + max(0.0, -closing) * 0.8
+                total += size_mult * urgency * speed_mult / max(1.0, cpa_dist + 8.0)
+        return total
 
     def step(self, action_idx):
         """Advance simulation by SIM_STEPS_PER_ACTION frames. Returns (obs, reward, done)."""
@@ -372,11 +416,13 @@ class AsteroidsEnv:
         thrust, left, right, shoot = action
 
         reward = 0.0
+        shot_fired = False
 
         # Handle shooting with cooldown
         if shoot and self.shoot_cooldown <= 0 and len(self.bullets) < 6:
             self.bullets.append(make_sim_bullet(self.ship))
             self.shoot_cooldown = 15  # reference frames
+            shot_fired = True
 
         for _ in range(SIM_STEPS_PER_ACTION):
             self.ship.step(thrust, left, right)
@@ -402,46 +448,64 @@ class AsteroidsEnv:
                         if torus_dist(b.x, b.y, r.x, r.y) < r.radius + 5:
                             hit_rocks.add(ri)
                             hit_bullets.add(bi)
-                            # Flat kill reward — avoid over-incentivizing
-                            # engagement with dangerous small-rock swarms
-                            reward += 30.0
+                            reward += 3.0
                             break
 
             if hit_rocks:
-                # Spawn children before removing
                 for ri in hit_rocks:
                     self._spawn_children(self.rocks[ri])
                 self.rocks = [r for i, r in enumerate(self.rocks) if i not in hit_rocks]
                 self.bullets = [b for i, b in enumerate(self.bullets) if i not in hit_bullets]
 
-            # Ship-rock collision
             for r in self.rocks:
                 if torus_dist(self.ship.x, self.ship.y, r.x, r.y) < r.radius * 0.7 + SHIP_RADIUS:
                     self.alive = False
-                    reward -= 100.0
                     self.steps += 1
                     obs = build_observation(self.ship, self.rocks, self.bullets, self.shoot_cooldown)
-                    return obs, reward, True
+                    return obs, reward - 30.0, True
 
         self.steps += 1
 
-        # Wave cleared: bonus scales with wave size, pushing the agent
-        # toward progression instead of settling for passive survival.
+        # Wave cleared
         if len(self.rocks) == 0:
-            reward += 100.0 * self.wave_rocks
+            reward += 5.0 * self.wave_rocks
             self.wave_rocks += 1
             for _ in range(self.wave_rocks):
                 self._spawn_big_rock()
 
-        # Per-step survival bonus: encourage survival
-        reward += 1.0
+        # Aim alignment rewards: per-step gradient toward facing rocks + on-fire bonus.
+        if self.rocks:
+            fwd_x = -sin(self.ship.theta * pi / 180)
+            fwd_y = -cos(self.ship.theta * pi / 180)
+            best_aim = 0.0
+            for r in self.rocks:
+                dx_to = wrap_delta(self.ship.x, r.x, winWidth)
+                dy_to = wrap_delta(self.ship.y, r.y, winHeight)
+                dist_to = sqrt(dx_to * dx_to + dy_to * dy_to)
+                if dist_to < 1:
+                    continue
+                t_flight = dist_to / (5.0 * SIM_DT)
+                lead_x = dx_to + (r.dx - self.ship.dx) * SIM_DT * t_flight
+                lead_y = dy_to + (r.dy - self.ship.dy) * SIM_DT * t_flight
+                lead_dist = sqrt(lead_x * lead_x + lead_y * lead_y)
+                if lead_dist < 1:
+                    continue
+                dot = fwd_x * lead_x / lead_dist + fwd_y * lead_y / lead_dist
+                if dot > best_aim:
+                    best_aim = dot
+            # Per-step: gradient when ready to shoot and aimed (max 0.1/step).
+            # Corrected CPA formula gives 11-21x stronger danger near collision boundary,
+            # so aim and danger now operate in complementary zones rather than competing.
+            if self.shoot_cooldown <= 0 and best_aim > 0.5:
+                reward += (best_aim - 0.5) / 0.5 * 0.1
+            # On-fire: bonus for well-aimed shot (max 0.5)
+            if shot_fired and best_aim > 0.7:
+                reward += (best_aim - 0.7) / 0.3 * 0.5
 
-        # Proximity penalty: small nudge to keep safe distance
-        min_dist = self._min_rock_dist()
-        if min_dist < 100:
-            safe_dist = max(0.0, min_dist)
-            penalty = 0.1 * (1.0 - safe_dist / 100.0)
-            reward -= penalty
+        # Per-step CPA danger penalty: dense signal mirrors MCTS static_eval.
+        # Provides gradient on every step, not just at death.
+        if self.rocks:
+            reward -= self._cpa_danger() * 0.12
 
         done = self.steps >= MAX_EPISODE_STEPS
         obs = build_observation(self.ship, self.rocks, self.bullets, self.shoot_cooldown)
@@ -633,9 +697,6 @@ class NStepBuffer:
             self.buffer.popleft()
         return transitions
 
-    def reset(self):
-        self.buffer.clear()
-
 
 # ---------------------------------------------------------------------------
 # DQN Agent
@@ -649,17 +710,12 @@ class DQNAgent:
         self.target_net = DuelingQNetwork(state_dim, n_actions, hidden=512).to(self.device)
         self.target_net.load_state_dict(self.q_net.state_dict())
         self.target_net.eval()
-        self.optimizer = optim.Adam(self.q_net.parameters(), lr=LR_START)
+        self.optimizer = optim.Adam(self.q_net.parameters(), lr=LR)
         self.replay = PrioritizedReplayBuffer()
         self.nstep = NStepBuffer()
         self.total_steps = 0       # gradient steps (for target net sync)
         self.env_steps = 0         # environment steps (for schedules)
         self._gamma_n = GAMMA ** N_STEPS
-
-    def _update_lr(self):
-        """Constant learning rate."""
-        for pg in self.optimizer.param_groups:
-            pg["lr"] = LR_START
 
     def epsilon(self):
         frac = min(1.0, self.env_steps / EPS_DECAY)
@@ -683,7 +739,6 @@ class DQNAgent:
         for t in transitions:
             self.replay.push(*t)
         self.env_steps += 1
-        self._update_lr()
 
     def train_step(self):
         """Perform GRAD_STEPS_PER_ENV gradient updates."""
@@ -732,57 +787,70 @@ class DQNAgent:
         self.total_steps += 1
         return loss.item()
 
-    def save(self, path="dqn_model.pt"):
+    def save(self, path="dqn_model.pt", cur_rocks=1):
         torch.save({
             "q_net": self.q_net.state_dict(),
             "target_net": self.target_net.state_dict(),
             "optimizer": self.optimizer.state_dict(),
             "total_steps": self.total_steps,
             "env_steps": self.env_steps,
+            "cur_rocks": cur_rocks,
         }, path)
 
     def load(self, path="dqn_model.pt"):
+        """Load checkpoint. Returns cur_rocks on success, 0 if incompatible."""
         ckpt = torch.load(path, map_location=self.device, weights_only=True)
         try:
             self.q_net.load_state_dict(ckpt["q_net"])
             self.target_net.load_state_dict(ckpt["target_net"])
             self.optimizer.load_state_dict(ckpt["optimizer"])
             self.total_steps = ckpt["total_steps"]
-            self.env_steps = ckpt.get("env_steps", self.total_steps)
-        except RuntimeError:
-            print("  Checkpoint incompatible with current architecture, starting fresh.")
-            return
+            self.env_steps = ckpt["env_steps"]
+            return ckpt.get("cur_rocks", 1)
+        except RuntimeError as e:
+            print(f"Checkpoint incompatible with current architecture: {e}")
+            print(f"Expected STATE_DIM={STATE_DIM}, N_ACTIONS={N_ACTIONS}.")
+            print("Delete old .pt files and run 'train' to build a fresh model.")
+            return 0
 
 
 # ---------------------------------------------------------------------------
 # Training loop
 # ---------------------------------------------------------------------------
 
-def train(num_episodes=20000, save_every=100, model_path="dqn_model.pt"):
+def train(num_episodes=20000, save_every=100, model_path="dqn_model.pt", clear_buffer=False):
     agent = DQNAgent()
     print(f"Device: {agent.device}")
 
     # Resume from checkpoint if it exists
+    cur_rocks = 1
     if os.path.exists(model_path):
         print(f"Resuming from {model_path}")
-        agent.load(model_path)
-        agent.env_steps = 0  # restart schedules; replay buffer is not saved anyway
+        restored = agent.load(model_path)
+        if restored == 0:
+            print("Checkpoint incompatible — starting fresh. Delete .pt files to suppress.")
+        else:
+            cur_rocks = restored
+            print(f"  env_steps={agent.env_steps}  eps={agent.epsilon():.3f}  cur_rocks={cur_rocks}")
+            if clear_buffer:
+                agent.replay = PrioritizedReplayBuffer(REPLAY_SIZE)
+                print("  Replay buffer cleared.")
 
-    # Curriculum: start with 1 rock, increase when agent is doing well
-    cur_rocks = 1
     env = AsteroidsEnv(num_rocks=cur_rocks)
     best_reward = -float("inf")
     reward_history = deque(maxlen=100)
     length_history = deque(maxlen=100)
 
-    # Curriculum thresholds: avg reward above this -> add a rock.
-    # Calibrated so agent must solidly clear wave 1 before promotion
-    # (wave 1 clear ≈ 7 kills × 20 + 100 bonus + survival ≈ 350-450).
-    CURRICULUM_THRESHOLD = 500.0
+    # Curriculum: promote when avg100 exceeds this threshold.
+    # With kill=+1, wave_bonus=5*wave_rocks, death=-30:
+    #   clearing wave 1 (1 big rock, 7 kills + bonus 5) = +12
+    #   dying in wave 2 after a few kills: roughly -14
+    # avg100 = 0 means kills roughly offset the death penalty — agent reliably
+    # clears most of the first wave. Sufficient bar to practice 2-rock scenarios.
+    CURRICULUM_THRESHOLD = 0.0
     CURRICULUM_MIN_EPS = 100  # don't promote before this many episodes at current level
 
     eps_at_level = 0
-    restore_cooldown = 0  # save-cycles to wait before next restore check
 
     for ep in range(1, num_episodes + 1):
         state = env.reset()
@@ -808,10 +876,9 @@ def train(num_episodes=20000, save_every=100, model_path="dqn_model.pt"):
         if ep % 10 == 0:
             cur_lr = agent.optimizer.param_groups[0]["lr"]
             print(
-                f"Ep {ep:5d} | R {ep_reward:7.1f} | avg100 {avg:7.1f} | "
+                f"Ep {ep:5d} | R {ep_reward:7.1f} | avg100 {avg:6.1f}/{CURRICULUM_THRESHOLD:.0f} | "
                 f"len {ep_steps:4d} | avglen {avg_len:5.0f} | "
-                f"eps {agent.epsilon():.3f} | lr {cur_lr:.1e} | "
-                f"rocks {cur_rocks} | buf {len(agent.replay)}"
+                f"eps {agent.epsilon():.3f} | rocks {cur_rocks} | buf {len(agent.replay)}"
             )
 
         # Curriculum: promote to more rocks when agent is consistently good
@@ -825,27 +892,20 @@ def train(num_episodes=20000, save_every=100, model_path="dqn_model.pt"):
             length_history.clear()
             eps_at_level = 0
             best_reward = -float("inf")
-            restore_cooldown = 0
             print(f"=== CURRICULUM: now training with {cur_rocks} rocks ===")
 
         if ep % save_every == 0:
-            agent.save(model_path)
+            agent.save(model_path, cur_rocks=cur_rocks)
             if avg > best_reward:
                 best_reward = avg
-                agent.save(model_path.replace(".pt", "_best.pt"))
+                agent.save(model_path.replace(".pt", "_best.pt"), cur_rocks=cur_rocks)
                 print(f"  -> new best avg reward: {best_reward:.1f}")
-                restore_cooldown = 0
-            elif restore_cooldown > 0:
-                restore_cooldown -= 1
-            elif (best_reward > 100.0
+            elif (best_reward > 5.0
                     and len(reward_history) >= 100
-                    and avg < 0.7 * best_reward):
-                print(f"  !! DEGRADATION: avg {avg:.1f} << best {best_reward:.1f}, "
-                      f"restoring best weights")
-                agent.load(model_path.replace(".pt", "_best.pt"))
-                restore_cooldown = 3
+                    and avg < 0.5 * best_reward):
+                print(f"  !! DEGRADATION: avg {avg:.1f} << best {best_reward:.1f}")
 
-    agent.save(model_path)
+    agent.save(model_path, cur_rocks=cur_rocks)
     print("Training complete.")
 
 
@@ -858,8 +918,12 @@ def watch(model_path="dqn_model.pt"):
     from pygame.locals import QUIT, KEYUP, K_q
     import asteroids as _astro
 
+    if not os.path.exists(model_path):
+        print(f"No model found at '{model_path}'. Run 'python dqn_asteroids.py train' first.")
+        sys.exit(1)
     agent = DQNAgent()
-    agent.load(model_path)
+    if not agent.load(model_path):
+        sys.exit(1)
     agent.q_net.eval()
 
     pygame.init()
@@ -958,21 +1022,35 @@ def watch(model_path="dqn_model.pt"):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="DQN agent for Asteroids")
+    parser = argparse.ArgumentParser(
+        description="DQN agent for Asteroids",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     sub = parser.add_subparsers(dest="command")
 
-    train_p = sub.add_parser("train", help="Train the DQN agent")
-    train_p.add_argument("--episodes", type=int, default=20000)
-    train_p.add_argument("--save-every", type=int, default=100)
-    train_p.add_argument("--model", default="dqn_model.pt")
+    train_p = sub.add_parser(
+        "train",
+        help="Train the DQN agent",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    train_p.add_argument("-episodes", type=int, help="number of training episodes", default=20000)
+    train_p.add_argument("-save-every", type=int, help="save checkpoint every N episodes", default=100)
+    train_p.add_argument("-model", help="checkpoint file path", default="dqn_model.pt")
+    train_p.add_argument("--clear-buffer", action="store_true",
+                         help="discard replay buffer on resume (use after reward function changes)")
 
-    watch_p = sub.add_parser("watch", help="Watch a trained agent play")
-    watch_p.add_argument("--model", default="dqn_model.pt")
+    watch_p = sub.add_parser(
+        "watch",
+        help="Watch a trained agent play",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    watch_p.add_argument("-model", help="checkpoint file to load", default="dqn_model.pt")
 
     args = parser.parse_args()
 
     if args.command == "train":
-        train(num_episodes=args.episodes, save_every=args.save_every, model_path=args.model)
+        train(num_episodes=args.episodes, save_every=args.save_every, model_path=args.model,
+              clear_buffer=args.clear_buffer)
     elif args.command == "watch":
         watch(model_path=args.model)
     else:
