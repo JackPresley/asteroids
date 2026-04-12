@@ -20,7 +20,7 @@ import numpy as np
 # Game constants (must match asteroids.py)
 # ---------------------------------------------------------------------------
 
-NUM_ROCKS = 5
+NUM_ROCKS = 10
 WIDTH = 900
 HEIGHT = 700
 winWidth = WIDTH + 1
@@ -185,7 +185,7 @@ SIM_STEPS_PER_ACTION = 4
 # Hyperparameters
 # ---------------------------------------------------------------------------
 
-MAX_ROCKS = 8           # observe up to this many rocks
+MAX_ROCKS = 12          # observe up to this many rocks
 MAX_BULLETS = 2         # observe up to this many bullets
 SHIP_FEATURES = 10      # ship state + cooldown + bullet count
 ROCK_FEATURES = 9       # pos(2) + vel(2) + radius + aim_dot + aim_cross + t_cpa + cpa_dist
@@ -462,7 +462,7 @@ class AsteroidsEnv:
                     self.alive = False
                     self.steps += 1
                     obs = build_observation(self.ship, self.rocks, self.bullets, self.shoot_cooldown)
-                    return obs, reward - 30.0, True
+                    return obs, reward - 15.0, True
 
         self.steps += 1
 
@@ -505,7 +505,7 @@ class AsteroidsEnv:
         # Per-step CPA danger penalty: dense signal mirrors MCTS static_eval.
         # Provides gradient on every step, not just at death.
         if self.rocks:
-            reward -= self._cpa_danger() * 0.12
+            reward -= self._cpa_danger() * 0.12 / max(1, len(self.rocks))
 
         done = self.steps >= MAX_EPISODE_STEPS
         obs = build_observation(self.ship, self.rocks, self.bullets, self.shoot_cooldown)
@@ -848,7 +848,7 @@ def train(num_episodes=20000, save_every=100, model_path="dqn_model.pt", clear_b
     # avg100 = 0 means kills roughly offset the death penalty — agent reliably
     # clears most of the first wave. Sufficient bar to practice 2-rock scenarios.
     CURRICULUM_THRESHOLD = 0.0
-    CURRICULUM_MIN_EPS = 100  # don't promote before this many episodes at current level
+    CURRICULUM_MIN_EPS = 300  # don't promote before this many episodes at current level
 
     eps_at_level = 0
 
