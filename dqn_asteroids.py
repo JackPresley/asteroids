@@ -13,6 +13,7 @@ from math import sin, cos, pi, sqrt
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 import numpy as np
 
@@ -198,7 +199,7 @@ LR = 1e-4
 BATCH_SIZE = 256
 REPLAY_SIZE = 400_000
 TARGET_TAU = 0.01           # Polyak soft-update rate for target network
-GRAD_STEPS_PER_ENV = 2      # gradient updates per environment step
+GRAD_STEPS_PER_ENV = 1      # gradient updates per environment step (transformer step ~3.5x MLP)
 GRAD_CLIP = 1.0             # max gradient norm
 EPS_START = 1.0
 EPS_END = 0.05
@@ -498,14 +499,14 @@ class AsteroidsEnv:
                 dot = fwd_x * lead_x / lead_dist + fwd_y * lead_y / lead_dist
                 if dot > best_aim:
                     best_aim = dot
-            # Per-step: gradient when ready to shoot and aimed (max 0.1/step).
-            # Corrected CPA formula gives 11-21x stronger danger near collision boundary,
-            # so aim and danger now operate in complementary zones rather than competing.
-            if self.shoot_cooldown <= 0 and best_aim > 0.5:
+            # Per-step aim gradient: no cooldown gate so shooting has zero cost.
+            # aim=0.10 > max danger 0.054/step → turning to aim beats evasion at range.
+            # on_fire=1.0 with no gate: net per shot = +0.09 (always worth shooting).
+            if best_aim > 0.5:
                 reward += (best_aim - 0.5) / 0.5 * 0.1
-            # On-fire: bonus for well-aimed shot (max 0.5)
+            # On-fire: bonus for a well-aimed shot (max 1.0)
             if shot_fired and best_aim > 0.7:
-                reward += (best_aim - 0.7) / 0.3 * 0.5
+                reward += (best_aim - 0.7) / 0.3 * 1.0
 
         # Per-step CPA danger penalty: dense signal mirrors MCTS static_eval.
         # Provides gradient on every step, not just at death.
@@ -521,6 +522,99 @@ class AsteroidsEnv:
 # ---------------------------------------------------------------------------
 # Q-Network
 # ---------------------------------------------------------------------------
+
+
+class _TransformerLayer(nn.Module):
+    """Pre-norm transformer encoder layer using fused QKV + F.scaled_dot_product_attention."""
+
+    def __init__(self, d_model: int, n_heads: int, ff_dim: int):
+        super().__init__()
+        self._n_heads = n_heads
+        self._head_dim = d_model // n_heads
+        self.qkv      = nn.Linear(d_model, 3 * d_model, bias=False)
+        self.out_proj = nn.Linear(d_model, d_model, bias=False)
+        self.ln1      = nn.LayerNorm(d_model)
+        self.ff1      = nn.Linear(d_model, ff_dim)
+        self.ff2      = nn.Linear(ff_dim, d_model)
+        self.ln2      = nn.LayerNorm(d_model)
+
+    def forward(self, x, pad_mask=None):
+        B, T, D = x.shape
+        H, d_k = self._n_heads, self._head_dim
+        # Pre-norm self-attention
+        residual = x
+        x = self.ln1(x)
+        qkv = self.qkv(x).reshape(B, T, 3, H, d_k).permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]
+        attn_bias = None
+        if pad_mask is not None:
+            attn_bias = (pad_mask.float()
+                         .masked_fill(pad_mask, float('-inf'))
+                         .unsqueeze(1).unsqueeze(1))
+        attn_out = F.scaled_dot_product_attention(q, k, v, attn_mask=attn_bias)
+        x = residual + self.out_proj(attn_out.transpose(1, 2).reshape(B, T, D))
+        # Pre-norm FFN
+        residual = x
+        x = self.ln2(x)
+        return residual + self.ff2(F.relu(self.ff1(x)))
+
+
+class EntityTransformerQNetwork(nn.Module):
+    """
+    Entity-based transformer Q-network. Drop-in replacement for DuelingQNetwork.
+    Same input: (B, STATE_DIM=128) flat obs. Same output: (B, N_ACTIONS=10) Q-values.
+
+    Token layout (15 tokens): [0]=ship, [1..12]=rock slots, [13..14]=bullet slots.
+    Masking: empty rock slots derived from obs[:, 7] (rock_count / MAX_ROCKS) so the
+    ship token cannot attend to zero-filled padding.
+    Aggregation: ship token (index 0) read out to dueling heads.
+    """
+
+    def __init__(self, state_dim=STATE_DIM, n_actions=N_ACTIONS,
+                 d_model=64, n_heads=4, n_layers=3, ff_dim=256):
+        super().__init__()
+        self.ship_proj   = nn.Linear(SHIP_FEATURES,   d_model)
+        self.rock_proj   = nn.Linear(ROCK_FEATURES,   d_model)
+        self.bullet_proj = nn.Linear(BULLET_FEATURES, d_model)
+        self.type_embed  = nn.Embedding(3, d_model)  # 0=ship, 1=rock, 2=bullet
+        self.layers      = nn.ModuleList(
+            [_TransformerLayer(d_model, n_heads, ff_dim) for _ in range(n_layers)]
+        )
+        self.final_ln = nn.LayerNorm(d_model)
+        self.value_stream = nn.Sequential(
+            nn.Linear(d_model, d_model), nn.ReLU(), nn.Linear(d_model, 1),
+        )
+        self.advantage_stream = nn.Sequential(
+            nn.Linear(d_model, d_model), nn.ReLU(), nn.Linear(d_model, n_actions),
+        )
+
+    @staticmethod
+    def _make_pad_mask(obs):
+        """(B, 15) bool mask — True = ignore token as attention key (empty rock slot)."""
+        B = obs.shape[0]
+        n_rocks = (obs[:, 7] * MAX_ROCKS).round().long().clamp(0, MAX_ROCKS)
+        slot_idx    = torch.arange(1, MAX_ROCKS + 1, device=obs.device).unsqueeze(0)
+        mask_rocks  = slot_idx > n_rocks.unsqueeze(1)              # (B, MAX_ROCKS)
+        ship_mask   = obs.new_zeros(B, 1,           dtype=torch.bool)
+        bullet_mask = obs.new_zeros(B, MAX_BULLETS, dtype=torch.bool)
+        return torch.cat([ship_mask, mask_rocks, bullet_mask], dim=1)  # (B, 15)
+
+    def forward(self, obs):
+        B = obs.shape[0]
+        ship_tok = (self.ship_proj(obs[:, :10]).unsqueeze(1)
+                    + self.type_embed.weight[0])                    # (B,  1, d)
+        rock_tok = (self.rock_proj(obs[:, 10:118].reshape(B, MAX_ROCKS, ROCK_FEATURES))
+                    + self.type_embed.weight[1])                    # (B, 12, d)
+        bullet_tok = (self.bullet_proj(obs[:, 118:128].reshape(B, MAX_BULLETS, BULLET_FEATURES))
+                      + self.type_embed.weight[2])                  # (B,  2, d)
+        tokens   = torch.cat([ship_tok, rock_tok, bullet_tok], dim=1)  # (B, 15, d)
+        pad_mask = self._make_pad_mask(obs)
+        for layer in self.layers:
+            tokens = layer(tokens, pad_mask)
+        ship_out  = self.final_ln(tokens)[:, 0]                    # (B, d)
+        value     = self.value_stream(ship_out)
+        advantage = self.advantage_stream(ship_out)
+        return value + advantage - advantage.mean(dim=1, keepdim=True)
 
 class DuelingQNetwork(nn.Module):
     """Dueling DQN: separate value and advantage streams."""
@@ -711,8 +805,8 @@ class DQNAgent:
     def __init__(self, state_dim=STATE_DIM, n_actions=N_ACTIONS, device=None):
         self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.n_actions = n_actions
-        self.q_net = DuelingQNetwork(state_dim, n_actions, hidden=512).to(self.device)
-        self.target_net = DuelingQNetwork(state_dim, n_actions, hidden=512).to(self.device)
+        self.q_net = EntityTransformerQNetwork(state_dim, n_actions).to(self.device)
+        self.target_net = EntityTransformerQNetwork(state_dim, n_actions).to(self.device)
         self.target_net.load_state_dict(self.q_net.state_dict())
         self.target_net.eval()
         self.optimizer = optim.Adam(self.q_net.parameters(), lr=LR)
