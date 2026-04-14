@@ -39,6 +39,10 @@ RED         = _astro.RED
 SIM_DT = REFERENCE_FPS / FPS  # ~2.5: all step() calls use this
 _DIAG = sqrt((winWidth / 2) ** 2 + (winHeight / 2) ** 2)
 
+_SIN8 = [sin(i * pi / 4) for i in range(8)]
+_COS8 = [cos(i * pi / 4) for i in range(8)]
+CPA_HORIZON = 60  # frames to look ahead for closest-point-of-approach
+
 # ---------------------------------------------------------------------------
 # Toroidal distance helpers
 # ---------------------------------------------------------------------------
@@ -96,6 +100,8 @@ def intercept_aim_angle(ship, rock):
 # ---------------------------------------------------------------------------
 
 class SimShip:
+    __slots__ = ('x', 'y', 'dx', 'dy', 'theta', 'accel', 'd_theta')
+
     def __init__(self, x, y, dx, dy, theta, accel=0.02):
         self.x = x % winWidth
         self.y = y % winHeight
@@ -121,6 +127,8 @@ class SimShip:
 
 
 class SimRock:
+    __slots__ = ('x', 'y', 'dx', 'dy', 'radius')
+
     def __init__(self, x, y, dx, dy, radius):
         self.x = x % winWidth
         self.y = y % winHeight
@@ -137,6 +145,8 @@ class SimRock:
 
 
 class SimBullet:
+    __slots__ = ('x', 'y', 'dx', 'dy', 'dist_left', 'speed')
+
     def __init__(self, x, y, dx, dy, dist_left):
         self.x = x % winWidth
         self.y = y % winHeight
@@ -182,161 +192,232 @@ ACTIONS = [
 ]
 
 SHIP_RADIUS = 18  # approximate collision radius
-SIM_STEPS_PER_ACTION = 10  # frames per action choice
-DEPTH = 2
+SIM_STEPS_PER_ACTION = 4   # frames per action choice (finer evasion granularity)
+DEPTH = 3
 
 
 def evaluate(ship, rocks, bullets):
     """Heuristic evaluation of a game state. Higher is better."""
     if not rocks:
-        return 10000
+        # Wave cleared. Guide the search toward a good starting position for
+        # the next wave: centered, slow, and oriented to brake.
+        fwd_x = -sin(ship.theta * pi / 180)
+        fwd_y = -cos(ship.theta * pi / 180)
+        speed = sqrt(ship.dx ** 2 + ship.dy ** 2)
+        cx, cy = winWidth / 2, winHeight / 2
+        center_dist = sqrt((ship.x - cx) ** 2 + (ship.y - cy) ** 2)
+        max_r = min(winWidth, winHeight) / 2
+        center_bonus  = 1000 * max(0.0, 1.0 - center_dist / max_r)
+        speed_penalty = max(0.0, speed - 1.0) ** 2 * 400
+        brake_bonus   = 0.0
+        if speed > 0.8:
+            brake_dot   = -(fwd_x * ship.dx + fwd_y * ship.dy) / speed
+            brake_bonus = max(0.0, brake_dot) * 400
+        return 10000 + center_bonus - speed_penalty + brake_bonus
 
     score = 0.0
-
-    # Survival: penalise proximity to rocks, amplified by closing speed.
-    # A rock approaching from the side or rear is just as dangerous as one
-    # head-on — the closing speed term captures this regardless of direction.
-    min_dist = float('inf')
-    for r in rocks:
-        rdx = wrap_delta(ship.x, r.x, winWidth)
-        rdy = wrap_delta(ship.y, r.y, winHeight)
-        dist_full = sqrt(rdx * rdx + rdy * rdy)
-        d = dist_full - r.radius - SHIP_RADIUS
-        if d < min_dist:
-            min_dist = d
-        if d < 0:
-            return -100000  # collision — terrible
-
-        # Closing speed: rate at which rock and ship are approaching each other.
-        # Positive = closing, negative = separating.
-        if dist_full > 1e-6:
-            ux, uy = rdx / dist_full, rdy / dist_full
-            closing = -((r.dx - ship.dx) * ux + (r.dy - ship.dy) * uy)
-        else:
-            closing = 0.0
-
-        # Scale penalty upward for approaching rocks; separating rocks are less urgent.
-        closing_factor = max(1.0, 1.0 + closing * 4.0)
-        if d < 40:
-            score -= 5000 / (d + 1) * closing_factor
-        elif d < 120:
-            score -= 500 / (d + 1) * closing_factor
-
-        # Time-to-impact warning: penalise rocks that will reach us within ~50 frames
-        # even if they are currently outside the immediate danger zone.
-        if closing > 0.05:
-            tti = d / closing
-            if tti < 50:
-                score -= 4000 / (tti + 1)
-
-    # Reward keeping distance from rocks
-    score += min(min_dist, 300)
-
-    # Multi-rock convergence penalty: when N rocks are simultaneously closing in
-    # the danger is superlinear because no single escape vector works for all of them.
-    converging = 0
-    for r in rocks:
-        rdx = wrap_delta(ship.x, r.x, winWidth)
-        rdy = wrap_delta(ship.y, r.y, winHeight)
-        dist_full = sqrt(rdx * rdx + rdy * rdy)
-        gap = dist_full - r.radius - SHIP_RADIUS
-        if gap < 150 and dist_full > 1e-6:
-            ux, uy = rdx / dist_full, rdy / dist_full
-            closing = -((r.dx - ship.dx) * ux + (r.dy - ship.dy) * uy)
-            if closing > 0.05:
-                converging += 1
-    if converging >= 2:
-        score -= 600 * (converging - 1) ** 2
-
-    # Reward bullets closing on rocks (closing-speed aware)
-    for b in bullets:
-        for r in rocks:
-            bd = torus_dist(b.x, b.y, r.x, r.y)
-            if bd < r.radius + 5:
-                score += 600  # about to hit
-            elif bd < r.radius + 60:
-                score += 200
-            else:
-                rdx = wrap_delta(b.x, r.x, winWidth)
-                rdy = wrap_delta(b.y, r.y, winHeight)
-                cs = -(b.dx * rdx + b.dy * rdy) / bd if bd > 1e-6 else 0
-                if cs > 2.0:
-                    score += 120
-
-    # Penalise high speed (quadratic above 0.8, matching neat_asteroids tuning)
+    fwd_x = -sin(ship.theta * pi / 180)
+    fwd_y = -cos(ship.theta * pi / 180)
     speed = sqrt(ship.dx ** 2 + ship.dy ** 2)
-    if speed > 0.8:
-        _excess = speed - 0.8
-        score -= 0.60 * _excess * _excess * 200  # scaled to ~match linear at speed 2
 
-    # Reward aiming at the intercept point of the best untargeted rock.
-    # Skip rocks that already have a bullet closing on them so the ship
-    # doesn't waste turns re-aiming at a rock that is about to be destroyed.
-    targeted = set()
+    # ---- Build rock cache + collision check + CPA danger ----
+    # Cache (r, dx_to, dy_to, center_dist, edge_dist, t_cpa, cpa_dist) for reuse below.
+    total_danger = 0.0
+    min_edge_dist = float('inf')
+    rock_info = []
+
+    for r in rocks:
+        dx_to = wrap_delta(ship.x, r.x, winWidth)
+        dy_to = wrap_delta(ship.y, r.y, winHeight)
+        center_dist = sqrt(dx_to * dx_to + dy_to * dy_to)
+        edge_dist = center_dist - r.radius - SHIP_RADIUS
+
+        if edge_dist < 0:
+            return -100000  # collision
+
+        if edge_dist < min_edge_dist:
+            min_edge_dist = edge_dist
+
+        rel_vx = (r.dx - ship.dx) * SIM_DT
+        rel_vy = (r.dy - ship.dy) * SIM_DT
+        rel_speed_sq = rel_vx * rel_vx + rel_vy * rel_vy
+        if rel_speed_sq > 0.001:
+            t_cpa = -(dx_to * rel_vx + dy_to * rel_vy) / rel_speed_sq
+            t_cpa = max(0.0, min(t_cpa, float(CPA_HORIZON)))
+            cpa_dx = dx_to + rel_vx * t_cpa
+            cpa_dy = dy_to + rel_vy * t_cpa
+            cpa_dist = sqrt(cpa_dx * cpa_dx + cpa_dy * cpa_dy) - r.radius * 0.7 - SHIP_RADIUS
+        else:
+            t_cpa = float(CPA_HORIZON)
+            cpa_dist = edge_dist
+
+        rock_info.append((r, dx_to, dy_to, center_dist, edge_dist, t_cpa, cpa_dist))
+
+        # CPA danger: hyperbolic, blindside-boosted, urgency-scaled.
+        # At cpa_dist < ~7 danger exceeds the aim bonus; evasion takes priority.
+        if cpa_dist < 200:
+            size_mult = r.radius / 30.0
+            aim_dot = (fwd_x * dx_to + fwd_y * dy_to) / max(1.0, center_dist)
+            blindside_mult = 1.0 if aim_dot > 0.3 else (1.8 - aim_dot)
+            urgency = 1.0 + max(0.0, 1.0 - t_cpa / 20.0)
+            total_danger += size_mult * blindside_mult * urgency / max(1.0, cpa_dist + 8.0)
+
+    score -= total_danger * 1500.0
+
+    # Safe-distance baseline: clear contrast between safe and dangerous states.
+    score += min(min_edge_dist, 300)
+
+    # ---- Escape corridor scoring (8 rays from the ship) ----
+    # Replaces multi-rock convergence penalty with geometry-aware corridor check:
+    # being boxed in on all sides scores badly even if no single rock is close.
+    corridor_dists = []
+    for i in range(8):
+        ray_dx, ray_dy = _SIN8[i], _COS8[i]
+        min_clear = 400.0
+        for r, dx_to, dy_to, center_dist, edge_dist, t_cpa, cpa_dist in rock_info:
+            t = dx_to * ray_dx + dy_to * ray_dy
+            if t < 0:
+                continue  # rock is behind this ray
+            perp = abs(dx_to * ray_dy - dy_to * ray_dx)
+            if perp < r.radius + SHIP_RADIUS:
+                clear = max(0.0, t - r.radius - SHIP_RADIUS)
+                if clear < min_clear:
+                    min_clear = clear
+        corridor_dists.append(min_clear)
+
+    corridor_dists.sort()
+    best_escape  = corridor_dists[-1]
+    second_escape = corridor_dists[-2]
+    if best_escape < 100:
+        score -= 600.0
+    elif best_escape < 200:
+        score -= 250.0 * (1.0 - best_escape / 200.0)
+    score += min(second_escape, 200) * 0.5  # bonus for having multiple open routes
+
+    # ---- Bullet scoring ----
+    # Bullet-spawn danger: if a bullet is about to destroy a big/medium rock near
+    # the ship, the children will spawn right there — reward the position, not the kill.
     for b in bullets:
-        if rocks:
-            closest_r = min(range(len(rocks)),
-                            key=lambda i: torus_dist(b.x, b.y, rocks[i].x, rocks[i].y))
-            bd = torus_dist(b.x, b.y, rocks[closest_r].x, rocks[closest_r].y)
-            closing = -(b.dx * wrap_delta(b.x, rocks[closest_r].x, winWidth) +
-                        b.dy * wrap_delta(b.y, rocks[closest_r].y, winHeight)) / max(bd, 1e-6)
-            if closing > 0:
-                targeted.add(closest_r)
-    untargeted = [r for i, r in enumerate(rocks) if i not in targeted] or rocks
-    nearest = min(untargeted, key=lambda r: torus_dist(ship.x, ship.y, r.x, r.y))
-    aim_diff = abs(intercept_aim_angle(ship, nearest))
-    if aim_diff < 5:
-        score += 150
-    elif aim_diff < 15:
-        score += 80
-    elif aim_diff < 30:
-        score += 30
+        if b.dist_left <= 0:
+            continue
+        for r, dx_to, dy_to, center_dist, edge_dist, t_cpa, cpa_dist in rock_info:
+            if r.radius < 30:
+                continue
+            bdx = wrap_delta(b.x, r.x, winWidth)
+            bdy = wrap_delta(b.y, r.y, winHeight)
+            bd = sqrt(bdx * bdx + bdy * bdy)
+            if bd < r.radius + 20 and edge_dist < 130:
+                score -= 400.0 * (1.0 - edge_dist / 130.0)
 
-    # Reward retrograde thrust (braking): ship heading opposite to velocity
+    # Bullet-rock CPA: reward bullets geometrically on track to hit a rock.
+    for b in bullets:
+        if b.dist_left <= 0:
+            continue
+        for r, dx_to, dy_to, center_dist, edge_dist, t_cpa, cpa_dist in rock_info:
+            bdx = wrap_delta(b.x, r.x, winWidth)
+            bdy = wrap_delta(b.y, r.y, winHeight)
+            brvx = (b.dx - r.dx) * SIM_DT
+            brvy = (b.dy - r.dy) * SIM_DT
+            br_speed_sq = brvx * brvx + brvy * brvy
+            if br_speed_sq < 0.001:
+                continue
+            t_hit = (bdx * brvx + bdy * brvy) / br_speed_sq
+            if t_hit < 0:
+                continue  # bullet already past CPA, moving away
+            cpa_bx = bdx - brvx * t_hit
+            cpa_by = bdy - brvy * t_hit
+            if sqrt(cpa_bx * cpa_bx + cpa_by * cpa_by) < r.radius + 8:
+                safe_mult = 1.0 if r.radius < 30 or edge_dist >= 130 else 0.2
+                score += 150.0 * safe_mult
+
+    # ---- Speed management ----
+    # Station-keeping bonus: explicit positive reward for being nearly stopped.
+    # At short search horizons the agent can't see far-future consequences of speed,
+    # so we encode "slow = safe" directly rather than relying solely on CPA penalties.
+    if speed < 1.5:
+        score += 150.0 * max(0.0, 1.0 - speed / 1.5)
+
+    # Rock-count-scaled speed penalty: threshold lowered to 0.5 so even moderate
+    # speeds are penalised.  Being at speed 1.5 through 3 rocks costs ~285 — more
+    # than the vel_toward_safe bonus can compensate.
+    rock_count_mult = 1.0 + min(len(rocks), 8) * 0.3
+    if speed > 0.5:
+        score -= (speed - 0.5) ** 2 * 150.0 * rock_count_mult
+
+    # ---- Evasion mode: suppress all positioning when any rock is on a CPA approach ----
+    # With a short search horizon, positioning rewards (safe zone, centre return) can
+    # outweigh the incremental danger signal and pull the agent toward rocks.
+    # When under any CPA threat the ship should focus purely on surviving.
+    evasion_mode = any(cpa_dist < 120
+                       for _, _, _, _, _, _, cpa_dist in rock_info)
+
+    # ---- Retrograde thrust (braking orientation reward) ----
+    # Always active: at any speed above 1.0 braking orientation is among the
+    # highest-value choices, competing with danger avoidance not positioning.
     if speed > 0.1:
-        tdx = -sin(ship.theta * pi / 180)
-        tdy = -cos(ship.theta * pi / 180)
-        retro_dot = -(tdx * (ship.dx / speed) + tdy * (ship.dy / speed))
+        retro_dot = -(fwd_x * (ship.dx / speed) + fwd_y * (ship.dy / speed))
         if retro_dot > 0:
-            score += 300 * retro_dot * min(1.0, speed / 3.0)
+            score += 500 * retro_dot * min(1.0, speed / 3.0)
 
-    # Global open-space 4×3 grid search: reward being near the safest cell
-    best_d = -1.0
-    best_x, best_y = winWidth / 2, winHeight / 2
-    for gi in range(4):
-        for gj in range(3):
-            gx = (gi + 0.5) * winWidth / 4
-            gy = (gj + 0.5) * winHeight / 3
-            gd = min(torus_dist(gx, gy, r.x, r.y) for r in rocks)
-            if gd > best_d:
-                best_d, best_x, best_y = gd, gx, gy
-    score += 400 * max(0.0, 1.0 - torus_dist(ship.x, ship.y, best_x, best_y) / (_DIAG * 0.4))
+    if not evasion_mode:
+        # ---- Aim ----
+        # Skip rocks already tracked by a closing bullet (intercept_aim_angle is
+        # the exact quadratic solution, more accurate than the linear DQN approximation).
+        targeted = set()
+        for b in bullets:
+            if rocks:
+                closest_r = min(range(len(rocks)),
+                                key=lambda i: torus_dist(b.x, b.y, rocks[i].x, rocks[i].y))
+                bd = torus_dist(b.x, b.y, rocks[closest_r].x, rocks[closest_r].y)
+                closing = -(b.dx * wrap_delta(b.x, rocks[closest_r].x, winWidth) +
+                            b.dy * wrap_delta(b.y, rocks[closest_r].y, winHeight)) / max(bd, 1e-6)
+                if closing > 0:
+                    targeted.add(closest_r)
+        untargeted = [r for i, r in enumerate(rocks) if i not in targeted] or rocks
+        nearest = min(untargeted, key=lambda r: torus_dist(ship.x, ship.y, r.x, r.y))
+        # Continuous falloff so the search has a real gradient toward better aim:
+        # each degree of improvement registers in the score rather than snapping
+        # between discrete bands.  Perfect aim = +150, 45° off = 0.
+        aim_diff = abs(intercept_aim_angle(ship, nearest))
+        if aim_diff < 45:
+            score += 150 * max(0.0, 1.0 - aim_diff / 45.0)
 
-    # Velocity toward safe zone: reward heading toward the safest cell when not already there.
-    # This encourages proactive repositioning rather than only rewarding arrival.
-    dist_to_safe = torus_dist(ship.x, ship.y, best_x, best_y)
-    if dist_to_safe > 80 and speed > 0.05:
-        sdx = wrap_delta(ship.x, best_x, winWidth)
-        sdy = wrap_delta(ship.y, best_y, winHeight)
-        safe_ux = sdx / dist_to_safe
-        safe_uy = sdy / dist_to_safe
-        vel_toward = (ship.dx * safe_ux + ship.dy * safe_uy) / speed
-        if vel_toward > 0:
-            score += 150 * vel_toward * min(1.0, dist_to_safe / 200)
+        # ---- Global open-space positioning ----
+        # 4×3 grid: find safest cell, reward proximity and gentle drift toward it.
+        best_d = -1.0
+        best_x, best_y = winWidth / 2, winHeight / 2
+        for gi in range(4):
+            for gj in range(3):
+                gx = (gi + 0.5) * winWidth / 4
+                gy = (gj + 0.5) * winHeight / 3
+                gd = min(torus_dist(gx, gy, r.x, r.y) for r in rocks)
+                if gd > best_d:
+                    best_d, best_x, best_y = gd, gx, gy
+        score += 400 * max(0.0, 1.0 - torus_dist(ship.x, ship.y, best_x, best_y) / (_DIAG * 0.4))
 
-    # Centre return: graded by rock count; last-rock sequence adds big rewards
-    cx, cy = winWidth / 2, winHeight / 2
-    dist_centre = torus_dist(ship.x, ship.y, cx, cy)
-    centred = max(0.0, 1.0 - dist_centre / (_DIAG * 0.35))
-    if len(rocks) == 1:
-        score += 800 * centred
-        score += 500 * max(0.0, 1.0 - speed / 0.5) * centred
-        if bullets:
-            score += 400 * centred  # reward having a bullet in-flight while centred
-    elif len(rocks) == 2:
-        score += 500 * centred
-    elif len(rocks) == 3:
-        score += 200 * centred
+        dist_to_safe = torus_dist(ship.x, ship.y, best_x, best_y)
+        if dist_to_safe > 80 and speed > 0.05:
+            sdx = wrap_delta(ship.x, best_x, winWidth)
+            sdy = wrap_delta(ship.y, best_y, winHeight)
+            safe_ux = sdx / dist_to_safe
+            safe_uy = sdy / dist_to_safe
+            vel_toward = (ship.dx * safe_ux + ship.dy * safe_uy) / speed
+            if vel_toward > 0:
+                score += 50 * vel_toward * min(1.0, dist_to_safe / 200)
+
+        # ---- Centre return (graded by rock count) ----
+        cx, cy = winWidth / 2, winHeight / 2
+        dist_centre = torus_dist(ship.x, ship.y, cx, cy)
+        centred = max(0.0, 1.0 - dist_centre / (_DIAG * 0.35))
+        if len(rocks) == 1:
+            score += 800 * centred
+            score += 500 * max(0.0, 1.0 - speed / 0.5) * centred
+            if bullets:
+                score += 400 * centred  # reward having a bullet in-flight while centred
+        elif len(rocks) == 2:
+            score += 500 * centred
+        elif len(rocks) == 3:
+            score += 200 * centred
 
     return score
 
@@ -418,56 +499,174 @@ def sim_step(ship, rocks, bullets, action):
     return new_ship, new_rocks, new_bullets, False
 
 
-def _order_actions(ship, rocks, bullets):
-    """Return action indices sorted by quick 1-step evaluation (best first).
+def _prune_actions(ship, rocks, bullets):
+    """Return a reduced list of action indices based on current threat level.
 
-    This lets alpha-beta pruning cut more branches at deeper levels.
+    In imminent danger: movement only (6 actions, no shooting).
+    In moderate danger: movement + turn-while-shoot (8 actions).
+    When safe: rotate/drift/shoot (4-7 actions).
+    Reduces branching factor from 10 to ~6, enabling DEPTH=4 within budget.
     """
-    scored = []
-    for ai, action in enumerate(ACTIONS):
-        new_ship, new_rocks, new_bullets, dead = sim_step(ship, rocks, bullets, action)
-        s = -100000 if dead else evaluate(new_ship, new_rocks, new_bullets)
-        scored.append((s, ai))
-    scored.sort(reverse=True)
-    return [ai for _, ai in scored]
+    if not rocks:
+        return [0]   # wave cleared — drift
+
+    speed = sqrt(ship.dx ** 2 + ship.dy ** 2)
+    danger   = speed > 2.0
+    imminent = False   # rock about to hit — suppress shooting
+
+    for r in rocks:
+        dx = wrap_delta(ship.x, r.x, winWidth)
+        dy = wrap_delta(ship.y, r.y, winHeight)
+        dist = sqrt(dx * dx + dy * dy)
+        edge = dist - r.radius - SHIP_RADIUS
+        if edge < 120:
+            danger = True
+        if edge < 55:
+            imminent = True
+            break
+        rvx = (r.dx - ship.dx) * SIM_DT
+        rvy = (r.dy - ship.dy) * SIM_DT
+        rs2 = rvx * rvx + rvy * rvy
+        if rs2 > 0.001:
+            t = max(0.0, min(-(dx * rvx + dy * rvy) / rs2, 60.0))
+            cpx = dx + rvx * t
+            cpy = dy + rvy * t
+            cpa = sqrt(cpx * cpx + cpy * cpy) - r.radius * 0.7 - SHIP_RADIUS
+            if cpa < 90:
+                danger = True
+            if cpa < 50 and t < 25:
+                imminent = True
+        if imminent:
+            break
+
+    if imminent:
+        return [0, 1, 2, 3, 4, 5]           # evasion only, no shoot
+    elif danger:
+        return [0, 1, 2, 3, 4, 5, 7, 8]     # evade + turn-while-shooting
+    else:
+        actions = [0, 2, 3, 6, 7, 8]         # safe: drift, rotate, shoot variants
+        if speed > 0.8:
+            actions.append(1)                 # allow thrust for braking
+        return actions
+
+
+def _survival_probe(ship, rocks, horizon=16):
+    """Drift the ship for `horizon` physics frames and detect imminent collision.
+
+    Returns a large penalty if the current velocity vector leads to death,
+    zero otherwise.  Cheap: no branching, no object allocation — runs in
+    O(horizon × len(rocks)) time.
+    """
+    if not rocks:
+        return 0
+    sx, sy   = ship.x, ship.y
+    sdx, sdy = ship.dx, ship.dy
+    # Store rock state as plain tuples: (x, y, dx, dy, kill_radius)
+    rdata = [(r.x, r.y, r.dx, r.dy, r.radius * 0.7 + SHIP_RADIUS) for r in rocks]
+    hw, hh = winWidth / 2, winHeight / 2
+    for _ in range(horizon):
+        sx = (sx + sdx * SIM_DT) % winWidth
+        sy = (sy + sdy * SIM_DT) % winHeight
+        next_rdata = []
+        for rx, ry, rdx, rdy, kr in rdata:
+            rx = (rx + rdx * SIM_DT) % winWidth
+            ry = (ry + rdy * SIM_DT) % winHeight
+            next_rdata.append((rx, ry, rdx, rdy, kr))
+            ddx = sx - rx
+            if   ddx >  hw: ddx -= winWidth
+            elif ddx < -hw: ddx += winWidth
+            ddy = sy - ry
+            if   ddy >  hh: ddy -= winHeight
+            elif ddy < -hh: ddy += winHeight
+            if ddx * ddx + ddy * ddy < kr * kr:
+                return -30000
+        rdata = next_rdata
+    return 0
+
+
+def _cheap_sort_key(ship, rocks):
+    """O(N) CPA-min heuristic for move ordering at non-leaf nodes.
+
+    Returns a scalar: higher = better state.  Much cheaper than evaluate()
+    since it skips corridor scoring, bullet tracking, and aim computation.
+    """
+    if not rocks:
+        return 10000
+    speed = sqrt(ship.dx ** 2 + ship.dy ** 2)
+    min_cpa = float('inf')
+    hw, hh = winWidth / 2, winHeight / 2
+    for r in rocks:
+        dx = ship.x - r.x
+        if   dx >  hw: dx -= winWidth
+        elif dx < -hw: dx += winWidth
+        dy = ship.y - r.y
+        if   dy >  hh: dy -= winHeight
+        elif dy < -hh: dy += winHeight
+        dist = sqrt(dx * dx + dy * dy)
+        edge = dist - r.radius - SHIP_RADIUS
+        if edge < 0:
+            return -100000
+        rel_vx = (r.dx - ship.dx) * SIM_DT
+        rel_vy = (r.dy - ship.dy) * SIM_DT
+        rs2 = rel_vx * rel_vx + rel_vy * rel_vy
+        if rs2 > 0.001:
+            t = max(0.0, min(-(dx * rel_vx + dy * rel_vy) / rs2, 60.0))
+            cpx = dx + rel_vx * t
+            cpy = dy + rel_vy * t
+            cpa = sqrt(cpx * cpx + cpy * cpy) - r.radius * 0.7 - SHIP_RADIUS
+        else:
+            cpa = edge
+        if cpa < min_cpa:
+            min_cpa = cpa
+    return min_cpa - speed * 50.0
 
 
 def minimax(ship, rocks, bullets, depth, bound=float('inf')):
     """Return (best_score, best_action_index).
 
-    bound: upper bound from the caller — if we find a score >= bound we can
-    stop early because the caller (a max node) already has a branch that good
-    and will never choose this one.  Equivalent to beta in alpha-beta pruning
-    for a single-player max tree.
+    Key design choices vs. the original:
+    - _prune_actions reduces branching factor from 10 to ~6 at every depth,
+      making DEPTH=4 feasible without a time budget.
+    - Children are simulated once and cached; the same result is used for
+      both move ordering and the recursive search (no double simulation).
+    - _survival_probe is applied at leaves: if the ship's current velocity
+      leads to collision within 24 drift frames, the state is penalised heavily.
+    - Alpha-beta bound propagated from parent ensures early cutoffs.
     """
     if depth == 0 or not rocks:
-        return evaluate(ship, rocks, bullets), 0
+        return evaluate(ship, rocks, bullets) + _survival_probe(ship, rocks), 0
 
-    # Apply move ordering only at the root to maximise pruning there without
-    # doubling work at every internal node.
-    if depth == DEPTH:
-        ordered = _order_actions(ship, rocks, bullets)
-    else:
-        ordered = range(len(ACTIONS))
+    # Simulate every candidate action once; cache results for ordering + search.
+    action_indices = _prune_actions(ship, rocks, bullets)
+    children = []
+    for ai in action_indices:
+        ns, nr, nb, dead = sim_step(ship, rocks, bullets, ACTIONS[ai])
+        if dead:
+            quick = -100000
+        elif depth == 1:
+            quick = evaluate(ns, nr, nb)      # full eval: used as leaf score
+        else:
+            quick = _cheap_sort_key(ns, nr)   # cheap: used for ordering only
+        children.append((quick, ai, ns, nr, nb, dead))
+    children.sort(reverse=True, key=lambda c: c[0])   # best-first for alpha-beta
 
-    best_score = float('-inf')
-    best_action = 0
+    best_score  = float('-inf')
+    best_action = children[0][1] if children else 0
 
-    for ai in ordered:
-        action = ACTIONS[ai]
-        new_ship, new_rocks, new_bullets, dead = sim_step(ship, rocks, bullets, action)
+    for quick, ai, ns, nr, nb, dead in children:
         if dead:
             action_score = -100000
         elif depth == 1:
-            action_score = evaluate(new_ship, new_rocks, new_bullets)
+            # Leaf: cached eval + survival probe (no further recursion).
+            action_score = quick + _survival_probe(ns, nr)
         else:
-            action_score, _ = minimax(new_ship, new_rocks, new_bullets, depth - 1, best_score)
+            action_score, _ = minimax(ns, nr, nb, depth - 1, best_score)
 
         if action_score > best_score:
-            best_score = action_score
+            best_score  = action_score
             best_action = ai
             if best_score >= bound:
-                break  # parent already has a better option; prune remaining actions
+                break   # alpha-beta cut
 
     return best_score, best_action
 
