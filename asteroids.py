@@ -5,7 +5,7 @@
 import pygame, sys
 from pygame.locals import *
 from random import randint
-from math import sin, cos, pi
+from math import sin, cos, pi, atan2, degrees
 
 """
 KNOWN ISSUES:
@@ -949,13 +949,23 @@ class Fader:
             )
             textBlit(
                 self.screen,
+                "<a> toggles simple AI pilot",
+                "Arial",
+                40,
+                BLUE,
+                "center",
+                winWidth / 2,
+                16.6 * winHeight / 24,
+            )
+            textBlit(
+                self.screen,
                 "Choose a space: <1> torus (default)",
                 "Arial",
                 40,
                 RED,
                 "center",
                 winWidth / 2,
-                17 * winHeight / 24,
+                17.7 * winHeight / 24,
             )
             textBlit(
                 self.screen,
@@ -965,7 +975,7 @@ class Fader:
                 RED,
                 "center",
                 winWidth / 2,
-                18.5 * winHeight / 24,
+                19.2 * winHeight / 24,
             )
             if Space.t_x == 1 and Space.t_y == 1:
                 textBlit(
@@ -1019,7 +1029,7 @@ class Fader:
                 RED,
                 "center",
                 winWidth / 2,
-                21.5 * winHeight / 24,
+                22 * winHeight / 24,
             )
         if screen_shot:
             return self.screen.subsurface(pygame.Rect(0, 0, WIDTH, HEIGHT)).copy()
@@ -1124,6 +1134,252 @@ class Burst:
         self.shoot = False
 
 
+class SimpleAI:
+    def __init__(self):
+        self.cooldown = 0
+        self.mode = "HUNT"
+        self.mode_timer = 0
+        self.evade_timer = 0
+        self.strafe_dir = 1
+        self.focus_x = None
+        self.focus_y = None
+        self.focus_timer = 0
+
+    def _angle_diff(self, a, b):
+        return (a - b + 540) % 360 - 180
+
+    def _turn_to_angle(self, ship, desired):
+        left = False
+        right = False
+        diff = self._angle_diff(desired, ship._theta)
+        if diff > 4:
+            left = True
+        elif diff < -4:
+            right = True
+        return left, right, diff
+
+    def _speed(self, ship):
+        return (ship.dx * ship.dx + ship.dy * ship.dy) ** 0.5
+
+    def _wrapped_delta(self, x1, y1, x2, y2):
+        dx = x2 - x1
+        dy = y2 - y1
+        if dx > winWidth / 2:
+            dx -= winWidth
+        if dx < -winWidth / 2:
+            dx += winWidth
+        if dy > winHeight / 2:
+            dy -= winHeight
+        if dy < -winHeight / 2:
+            dy += winHeight
+        return dx, dy
+
+    def _tick_timers(self, dt):
+        if self.cooldown > 0:
+            self.cooldown -= dt
+        if self.mode_timer > 0:
+            self.mode_timer -= dt
+        if self.evade_timer > 0:
+            self.evade_timer -= dt
+        if self.focus_timer > 0:
+            self.focus_timer -= dt
+        elif self.focus_timer < 0:
+            self.focus_timer = 0
+
+    def _clear_focus(self):
+        self.focus_timer = 0
+        self.focus_x = None
+        self.focus_y = None
+
+    def _center_behavior(self, ship, speed):
+        thrust = False
+        left = False
+        right = False
+        shoot = False
+        brake = False
+        cx = winWidth / 2
+        cy = winHeight / 2
+        center_dx, center_dy = self._wrapped_delta(ship.p.x, ship.p.y, cx, cy)
+        center_dist2 = center_dx * center_dx + center_dy * center_dy
+        center_dist = center_dist2 ** 0.5
+        center_v = 0
+        if center_dist > 0:
+            center_v = (center_dx * ship.dx + center_dy * ship.dy) / center_dist
+        desired = degrees(atan2(-center_dx, -center_dy))
+        left, right, diff = self._turn_to_angle(ship, desired)
+        self.mode = "CENTER"
+        if center_dist > 90 and abs(diff) < 14 and speed < 1.3 and center_v < 1.0:
+            thrust = True
+        if center_dist < 140 and center_v < -0.1 and speed > 0.25:
+            brake = True
+        if center_dist < 90 and speed > 0.22:
+            brake = True
+        if center_dist <= 55 and speed > 0.12:
+            brake = True
+        return thrust, left, right, shoot, brake, self.mode
+
+    def _count_close_rocks(self, ship, rocks, radius=220):
+        count = 0
+        r2 = radius * radius
+        for rock in rocks:
+            cdx, cdy = self._wrapped_delta(ship.p.x, ship.p.y, rock.p.x, rock.p.y)
+            if cdx * cdx + cdy * cdy < r2:
+                count += 1
+        return count
+
+    def _lead_angle(self, ship, rock, dx, dy, dist):
+        rel_vx = rock.dx - ship.dx
+        rel_vy = rock.dy - ship.dy
+        bullet_speed = 5.0
+        t = dist / bullet_speed
+        if t > 45:
+            t = 45
+        lead_dx = dx + rel_vx * t
+        lead_dy = dy + rel_vy * t
+        return degrees(atan2(-lead_dx, -lead_dy))
+
+    def _pick_mode(self, dist, close_count):
+        if dist < 95 or (dist < 135 and close_count >= 3):
+            self.mode = "EVADE"
+            self.evade_timer = 12
+        elif self.mode == "EVADE" and self.evade_timer <= 0:
+            self.mode = "HUNT"
+            self.mode_timer = 16
+        elif self.mode_timer <= 0:
+            if dist > 360:
+                self.mode = "CHASE"
+                self.mode_timer = 45
+            else:
+                if randint(0, 1) == 0:
+                    self.mode = "HUNT"
+                else:
+                    self.mode = "STRAFE"
+                    self.strafe_dir = -1 if randint(0, 1) == 0 else 1
+                self.mode_timer = 35
+
+    def _nearest_rock(self, ship, rocks):
+        best = None
+        best_risk = None
+        for rock in rocks:
+            size = rock.rect.width
+            for sx in (-winWidth, 0, winWidth):
+                for sy in (-winHeight, 0, winHeight):
+                    dx = rock.p.x + sx - ship.p.x
+                    dy = rock.p.y + sy - ship.p.y
+                    d2 = dx * dx + dy * dy
+                    dist = d2 ** 0.5
+                    if dist < 1:
+                        dist = 1
+                    rel_vx = rock.dx - ship.dx
+                    rel_vy = rock.dy - ship.dy
+                    closing = -((dx * rel_vx + dy * rel_vy) / dist)
+                    risk = dist - 90 * closing - 0.5 * size
+                    if self.focus_timer > 0 and self.focus_x is not None:
+                        fx = rock.p.x + sx - self.focus_x
+                        fy = rock.p.y + sy - self.focus_y
+                        focus_dist = (fx * fx + fy * fy) ** 0.5
+                        if focus_dist < 320:
+                            risk -= (320 - focus_dist) * 1.2
+                    if dist < 180:
+                        risk -= 120
+                    if best_risk is None or risk < best_risk:
+                        best_risk = risk
+                        best = (rock, dx, dy, d2)
+        return best
+
+    def update(self, ship, rocks, dt=1):
+        thrust = False
+        left = False
+        right = False
+        shoot = False
+        brake = False
+
+        self._tick_timers(dt)
+        speed = self._speed(ship)
+
+        target = self._nearest_rock(ship, rocks)
+        if target is None:
+            self._clear_focus()
+            return self._center_behavior(ship, speed)
+
+        target_rock, dx, dy, dist2 = target
+        dist = dist2 ** 0.5
+        close_count = self._count_close_rocks(ship, rocks)
+
+        if self.focus_timer > 0 and self.focus_x is not None:
+            fx = target_rock.p.x - self.focus_x
+            fy = target_rock.p.y - self.focus_y
+            if fx > winWidth / 2:
+                fx -= winWidth
+            if fx < -winWidth / 2:
+                fx += winWidth
+            if fy > winHeight / 2:
+                fy -= winHeight
+            if fy < -winHeight / 2:
+                fy += winHeight
+            if (fx * fx + fy * fy) ** 0.5 > 380:
+                self._clear_focus()
+
+        self._pick_mode(dist, close_count)
+
+        if self.focus_timer > 0 and self.mode != "EVADE":
+            self.mode = "FINISH"
+
+        aim_desired = self._lead_angle(ship, target_rock, dx, dy, dist)
+        desired = aim_desired
+
+        if self.mode == "EVADE":
+            desired = (degrees(atan2(-dx, -dy)) + 180) % 360
+        elif self.mode == "STRAFE":
+            desired = (desired + 70 * self.strafe_dir) % 360
+
+        left, right, diff = self._turn_to_angle(ship, desired)
+        aim_diff = self._angle_diff(aim_desired, ship._theta)
+
+        if self.mode == "EVADE" and self.evade_timer <= 0 and dist > 150:
+            self.mode = "HUNT"
+            left, right, diff = self._turn_to_angle(ship, aim_desired)
+
+        hold_zone = 190 <= dist <= 360
+        if hold_zone and abs(diff) < 18 and speed > 0.7 and self.mode != "EVADE":
+            brake = True
+
+        if self.mode == "EVADE":
+            if (dist < 125 or close_count >= 4) and speed < 2.2:
+                thrust = True
+            elif speed > 2.6:
+                brake = True
+        elif self.mode == "CHASE":
+            if dist > 300 and abs(diff) < 20 and speed < 1.8:
+                thrust = True
+            elif speed > 2.2:
+                brake = True
+        elif self.mode == "STRAFE":
+            if dist < 250 and abs(diff) < 28 and speed < 1.4:
+                thrust = True
+            elif speed > 1.8:
+                brake = True
+        else:
+            if dist > 260 and abs(diff) < 18 and speed < 1.6:
+                thrust = True
+            elif speed > 2.0:
+                brake = True
+
+        can_evade_shoot = self.mode == "EVADE" and (close_count >= 3 or dist < 200)
+        if (
+            dist < 560
+            and self.cooldown <= 0
+            and ((self.mode != "EVADE" and abs(diff) < 8) or (can_evade_shoot and abs(aim_diff) < 10))
+        ):
+            shoot = True
+            self.cooldown = 10 if can_evade_shoot else 12
+            self.focus_x = target_rock.p.x
+            self.focus_y = target_rock.p.y
+            self.focus_timer = 900
+
+        return thrust, left, right, shoot, brake, self.mode
+
+
 def main():
 
     global fpsClock, Score
@@ -1145,6 +1401,9 @@ def main():
     rocks = pygame.sprite.Group()
 
     burst = Burst()  # rapid fire
+    ai = SimpleAI()
+    ai_mode = False
+    ai_state = "OFF"
 
     starting_up = True
     pause = False
@@ -1171,18 +1430,34 @@ def main():
                     sys.exit()
                 if event.key == K_p:
                     pause = True
+                if event.key == K_a:
+                    ai_mode = not ai_mode
         thrust = left = right = False
-        keys = pygame.key.get_pressed()
-        if keys[K_UP]:
-            thrust = True
-        if keys[K_LEFT]:
-            left = True
-        if keys[K_RIGHT]:
-            right = True
+        shoot = False
+        brake = False
+        if ai_mode:
+            thrust, left, right, shoot, brake, ai_state = ai.update(ship, rocks, dt)
+        else:
+            ai_state = "OFF"
+            keys = pygame.key.get_pressed()
+            if keys[K_UP]:
+                thrust = True
+            if keys[K_LEFT]:
+                left = True
+            if keys[K_RIGHT]:
+                right = True
+            if keys[K_d] or keys[K_DOWN]:
+                brake = True
 
         screen.fill(WHITE)
 
         ship.update(thrust, left, right, dt)
+
+        if brake:
+            ship.dx = ship.dy = 0
+
+        if shoot:
+            Bullet(screen, ship, bullets)
 
         if burst.update(dt):
             Bullet(screen, ship, bullets)
@@ -1209,6 +1484,17 @@ def main():
                 BigRock(screen, rocks)
 
         Score.draw(screen, rocks)
+        textBlit(
+            screen,
+            "AI: " + ai_state,
+            "Arial",
+            30,
+            BLUE,
+            "topleft",
+            14 * winWidth / 20,
+            winHeight / 20,
+            False,
+        )
 
         if len(rocks) == 0:
             if fader.frames > 0:
@@ -1217,6 +1503,8 @@ def main():
                 fader.reset()
                 bullets.empty()
                 pygame.event.clear()
+                ai.mode = "PATROL"
+                ai.mode_timer = 0
                 num_rocks += 1
                 while len(rocks) < num_rocks:
                     BigRock(screen, rocks)
