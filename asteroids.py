@@ -359,6 +359,11 @@ class Ship(MySprite):  # This class extends the MySprite class defined above
         self.draw(engines)
 
 
+def spawn_companion_ship(screen):
+    """Spawn a second ship for co-op slightly offset from center."""
+    return Ship(screen, x=winWidth / 2 + 90, y=winHeight / 2)
+
+
 class Bullet(MySprite):
     _image_cache = None
     RADIUS = 5
@@ -959,13 +964,23 @@ class Fader:
             )
             textBlit(
                 self.screen,
+                "<o> toggles co-op with AI wingman",
+                "Arial",
+                40,
+                BLUE,
+                "center",
+                winWidth / 2,
+                17.7 * winHeight / 24,
+            )
+            textBlit(
+                self.screen,
                 "Choose a space: <1> torus (default)",
                 "Arial",
                 40,
                 RED,
                 "center",
                 winWidth / 2,
-                17.7 * winHeight / 24,
+                18.8 * winHeight / 24,
             )
             textBlit(
                 self.screen,
@@ -975,7 +990,7 @@ class Fader:
                 RED,
                 "center",
                 winWidth / 2,
-                19.2 * winHeight / 24,
+                20.0 * winHeight / 24,
             )
             if Space.t_x == 1 and Space.t_y == 1:
                 textBlit(
@@ -986,7 +1001,7 @@ class Fader:
                     BLUE,
                     "center",
                     winWidth / 2,
-                    20 * winHeight / 24,
+                    21 * winHeight / 24,
                 )
             if Space.t_x == 1 and Space.t_y == -1:
                 textBlit(
@@ -997,7 +1012,7 @@ class Fader:
                     BLUE,
                     "center",
                     winWidth / 2,
-                    20 * winHeight / 24,
+                    21 * winHeight / 24,
                 )
             if Space.t_x == -1 and Space.t_y == 1:
                 textBlit(
@@ -1008,7 +1023,7 @@ class Fader:
                     BLUE,
                     "center",
                     winWidth / 2,
-                    20 * winHeight / 24,
+                    21 * winHeight / 24,
                 )
             if Space.t_x == -1 and Space.t_y == -1:
                 textBlit(
@@ -1019,7 +1034,7 @@ class Fader:
                     BLUE,
                     "center",
                     winWidth / 2,
-                    20 * winHeight / 24,
+                    21 * winHeight / 24,
                 )
             textBlit(
                 self.screen,
@@ -1029,7 +1044,7 @@ class Fader:
                 RED,
                 "center",
                 winWidth / 2,
-                22 * winHeight / 24,
+                23 * winHeight / 24,
             )
         if screen_shot:
             return self.screen.subsurface(pygame.Rect(0, 0, WIDTH, HEIGHT)).copy()
@@ -1394,7 +1409,8 @@ def main():
 
     fader.start_up()  # show a startup animation and CONTROLS
 
-    ship = Ship(screen)  # create a Ship
+    ship = Ship(screen)  # player ship
+    wingman = None
 
     # set up some groups
     bullets = pygame.sprite.Group()
@@ -1402,8 +1418,11 @@ def main():
 
     burst = Burst()  # rapid fire
     ai = SimpleAI()
+    wingman_ai = SimpleAI()
     ai_mode = False
     ai_state = "OFF"
+    coop_mode = False
+    wingman_state = "OFF"
 
     starting_up = True
     pause = False
@@ -1422,7 +1441,7 @@ def main():
             elif event.type == KEYDOWN:
                 if event.key == K_b:
                     burst.shoot = True
-                if event.key == K_SPACE:
+                if event.key == K_SPACE and ship is not None:
                     Bullet(screen, ship, bullets)
             elif event.type == KEYUP:
                 if event.key == K_q:
@@ -1432,10 +1451,22 @@ def main():
                     pause = True
                 if event.key == K_a:
                     ai_mode = not ai_mode
+                if event.key == K_o:
+                    coop_mode = not coop_mode
+                    if coop_mode:
+                        if wingman is None:
+                            wingman = spawn_companion_ship(screen)
+                            wingman_ai = SimpleAI()
+                    else:
+                        wingman = None
+                        wingman_state = "OFF"
+
         thrust = left = right = False
         shoot = False
         brake = False
-        if ai_mode:
+        if ship is None:
+            ai_state = "DESTROYED"
+        elif ai_mode:
             thrust, left, right, shoot, brake, ai_state = ai.update(ship, rocks, dt)
         else:
             ai_state = "OFF"
@@ -1449,26 +1480,64 @@ def main():
             if keys[K_d] or keys[K_DOWN]:
                 brake = True
 
+        wingman_thrust = wingman_left = wingman_right = False
+        wingman_shoot = False
+        wingman_brake = False
+        if coop_mode and wingman is not None:
+            (
+                wingman_thrust,
+                wingman_left,
+                wingman_right,
+                wingman_shoot,
+                wingman_brake,
+                wingman_state,
+            ) = wingman_ai.update(wingman, rocks, dt)
+        else:
+            wingman_state = "OFF"
+
         screen.fill(WHITE)
 
-        ship.update(thrust, left, right, dt)
+        if ship is not None:
+            ship.update(thrust, left, right, dt)
+        if coop_mode and wingman is not None:
+            wingman.update(wingman_thrust, wingman_left, wingman_right, dt)
 
-        if brake:
+        if ship is not None and brake:
             ship.dx = ship.dy = 0
+        if coop_mode and wingman is not None and wingman_brake:
+            wingman.dx = wingman.dy = 0
 
-        if shoot:
+        if ship is not None and shoot:
             Bullet(screen, ship, bullets)
+        if coop_mode and wingman is not None and wingman_shoot:
+            Bullet(screen, wingman, bullets)
 
-        if burst.update(dt):
+        if ship is not None and burst.update(dt):
             Bullet(screen, ship, bullets)
 
         if bullets:
             bullets.update(bullets, rocks, dt)
         rocks.update(dt)
 
-        if pygame.sprite.spritecollideany(
-            ship, rocks, pygame.sprite.collide_circle_ratio(0.7)
-        ):
+        ship_destroyed = False
+        if ship is not None:
+            ship_destroyed = pygame.sprite.spritecollideany(
+                ship, rocks, pygame.sprite.collide_circle_ratio(0.7)
+            )
+            if ship_destroyed:
+                ship = None
+                ai_state = "DESTROYED"
+
+        if coop_mode and wingman is not None:
+            wingman_destroyed = pygame.sprite.spritecollideany(
+                wingman, rocks, pygame.sprite.collide_circle_ratio(0.7)
+            )
+            if wingman_destroyed:
+                wingman = None
+                wingman_state = "DESTROYED"
+
+        round_over = ship is None and (not coop_mode or wingman is None)
+        if round_over:
             fader.use_a_life()
             fader.reset()
             if Score.getLives() == 0:
@@ -1477,9 +1546,17 @@ def main():
                 Score.reset()
             bullets.empty()
             rocks.empty()
-            del ship
             pygame.event.clear()
             ship = Ship(screen)
+            ai = SimpleAI()
+            ai_state = "OFF"
+            if coop_mode:
+                wingman = spawn_companion_ship(screen)
+                wingman_ai = SimpleAI()
+                wingman_state = "HUNT"
+            else:
+                wingman = None
+                wingman_state = "OFF"
             while len(rocks) < num_rocks:
                 BigRock(screen, rocks)
 
@@ -1493,6 +1570,28 @@ def main():
             "topleft",
             14 * winWidth / 20,
             winHeight / 20,
+            False,
+        )
+        textBlit(
+            screen,
+            "CO-OP: " + ("ON" if coop_mode else "OFF"),
+            "Arial",
+            26,
+            BLUE,
+            "topleft",
+            14 * winWidth / 20,
+            1.8 * winHeight / 20,
+            False,
+        )
+        textBlit(
+            screen,
+            "Wingman AI: " + wingman_state,
+            "Arial",
+            26,
+            BLUE,
+            "topleft",
+            14 * winWidth / 20,
+            2.6 * winHeight / 20,
             False,
         )
 
