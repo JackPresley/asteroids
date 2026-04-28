@@ -302,7 +302,7 @@ class MySprite(pygame.sprite.Sprite):
         self.rect.center = self.p.x, self.p.y
 
 
-class Ship(MySprite):  # This class extends the MySprite class defined above
+class Ship(MySprite): 
     _images_cache = None
 
     @classmethod
@@ -378,8 +378,8 @@ class Bullet(MySprite):
             cls._image_cache = image
 
     def __init__(self, screen, ship, bullets, speed=5, distance=6 * winHeight / 7):
-        self.speed = speed  # distance travelled by the bullet per game loop
-        self.distance = distance  # distance the bullet travels before disappearing
+        self.speed = speed 
+        self.distance = distance 
         self.min_dist = ship.rect.width / 2
         #  x = ship.p.x-ship.rect[2]/2*sin(ship._theta*pi/180)
         #  y = ship.p.y-ship.rect[3]/2*cos(ship._theta*pi/180)
@@ -954,7 +954,7 @@ class Fader:
             )
             textBlit(
                 self.screen,
-                "<a> toggles simple AI pilot",
+                "<a> AI pilot on/off",
                 "Arial",
                 40,
                 BLUE,
@@ -964,7 +964,7 @@ class Fader:
             )
             textBlit(
                 self.screen,
-                "<o> toggles co-op with AI wingman",
+                "<o> co-op wingman on/off",
                 "Arial",
                 40,
                 BLUE,
@@ -1130,7 +1130,6 @@ class Burst:
         self.timer = self.delay  # fires immediately on first update
 
     def update(self, dt):
-        """Returns True when a bullet should be fired."""
         if not self.shoot:
             return False
         if self.shots_left <= 0:
@@ -1150,9 +1149,16 @@ class Burst:
 
 
 class SimpleAI:
+    MODE_HUNT = "HUNT"
+    MODE_EVADE = "EVADE"
+    MODE_CHASE = "CHASE"
+    MODE_STRAFE = "STRAFE"
+    MODE_FINISH = "FINISH"
+    MODE_CENTER = "CENTER"
+
     def __init__(self):
         self.cooldown = 0
-        self.mode = "HUNT"
+        self.mode = self.MODE_HUNT
         self.mode_timer = 0
         self.evade_timer = 0
         self.strafe_dir = 1
@@ -1176,17 +1182,18 @@ class SimpleAI:
     def _speed(self, ship):
         return (ship.dx * ship.dx + ship.dy * ship.dy) ** 0.5
 
+    def _wrap_axis_delta(self, a, b, span):
+        d = b - a
+        half = span / 2
+        if d > half:
+            d -= span
+        if d < -half:
+            d += span
+        return d
+
     def _wrapped_delta(self, x1, y1, x2, y2):
-        dx = x2 - x1
-        dy = y2 - y1
-        if dx > winWidth / 2:
-            dx -= winWidth
-        if dx < -winWidth / 2:
-            dx += winWidth
-        if dy > winHeight / 2:
-            dy -= winHeight
-        if dy < -winHeight / 2:
-            dy += winHeight
+        dx = self._wrap_axis_delta(x1, x2, winWidth)
+        dy = self._wrap_axis_delta(y1, y2, winHeight)
         return dx, dy
 
     def _tick_timers(self, dt):
@@ -1222,7 +1229,7 @@ class SimpleAI:
             center_v = (center_dx * ship.dx + center_dy * ship.dy) / center_dist
         desired = degrees(atan2(-center_dx, -center_dy))
         left, right, diff = self._turn_to_angle(ship, desired)
-        self.mode = "CENTER"
+        self.mode = self.MODE_CENTER
         if center_dist > 90 and abs(diff) < 14 and speed < 1.3 and center_v < 1.0:
             thrust = True
         if center_dist < 140 and center_v < -0.1 and speed > 0.25:
@@ -1255,20 +1262,20 @@ class SimpleAI:
 
     def _pick_mode(self, dist, close_count):
         if dist < 95 or (dist < 135 and close_count >= 3):
-            self.mode = "EVADE"
+            self.mode = self.MODE_EVADE
             self.evade_timer = 12
-        elif self.mode == "EVADE" and self.evade_timer <= 0:
-            self.mode = "HUNT"
+        elif self.mode == self.MODE_EVADE and self.evade_timer <= 0:
+            self.mode = self.MODE_HUNT
             self.mode_timer = 16
         elif self.mode_timer <= 0:
             if dist > 360:
-                self.mode = "CHASE"
+                self.mode = self.MODE_CHASE
                 self.mode_timer = 45
             else:
                 if randint(0, 1) == 0:
-                    self.mode = "HUNT"
+                    self.mode = self.MODE_HUNT
                 else:
-                    self.mode = "STRAFE"
+                    self.mode = self.MODE_STRAFE
                     self.strafe_dir = -1 if randint(0, 1) == 0 else 1
                 self.mode_timer = 35
 
@@ -1322,54 +1329,45 @@ class SimpleAI:
         close_count = self._count_close_rocks(ship, rocks)
 
         if self.focus_timer > 0 and self.focus_x is not None:
-            fx = target_rock.p.x - self.focus_x
-            fy = target_rock.p.y - self.focus_y
-            if fx > winWidth / 2:
-                fx -= winWidth
-            if fx < -winWidth / 2:
-                fx += winWidth
-            if fy > winHeight / 2:
-                fy -= winHeight
-            if fy < -winHeight / 2:
-                fy += winHeight
+            fx, fy = self._wrapped_delta(self.focus_x, self.focus_y, target_rock.p.x, target_rock.p.y)
             if (fx * fx + fy * fy) ** 0.5 > 380:
                 self._clear_focus()
 
         self._pick_mode(dist, close_count)
 
-        if self.focus_timer > 0 and self.mode != "EVADE":
-            self.mode = "FINISH"
+        if self.focus_timer > 0 and self.mode != self.MODE_EVADE:
+            self.mode = self.MODE_FINISH
 
         aim_desired = self._lead_angle(ship, target_rock, dx, dy, dist)
         desired = aim_desired
 
-        if self.mode == "EVADE":
+        if self.mode == self.MODE_EVADE:
             desired = (degrees(atan2(-dx, -dy)) + 180) % 360
-        elif self.mode == "STRAFE":
+        elif self.mode == self.MODE_STRAFE:
             desired = (desired + 70 * self.strafe_dir) % 360
 
         left, right, diff = self._turn_to_angle(ship, desired)
         aim_diff = self._angle_diff(aim_desired, ship._theta)
 
-        if self.mode == "EVADE" and self.evade_timer <= 0 and dist > 150:
-            self.mode = "HUNT"
+        if self.mode == self.MODE_EVADE and self.evade_timer <= 0 and dist > 150:
+            self.mode = self.MODE_HUNT
             left, right, diff = self._turn_to_angle(ship, aim_desired)
 
         hold_zone = 190 <= dist <= 360
-        if hold_zone and abs(diff) < 18 and speed > 0.7 and self.mode != "EVADE":
+        if hold_zone and abs(diff) < 18 and speed > 0.7 and self.mode != self.MODE_EVADE:
             brake = True
 
-        if self.mode == "EVADE":
+        if self.mode == self.MODE_EVADE:
             if (dist < 125 or close_count >= 4) and speed < 2.2:
                 thrust = True
             elif speed > 2.6:
                 brake = True
-        elif self.mode == "CHASE":
+        elif self.mode == self.MODE_CHASE:
             if dist > 300 and abs(diff) < 20 and speed < 1.8:
                 thrust = True
             elif speed > 2.2:
                 brake = True
-        elif self.mode == "STRAFE":
+        elif self.mode == self.MODE_STRAFE:
             if dist < 250 and abs(diff) < 28 and speed < 1.4:
                 thrust = True
             elif speed > 1.8:
@@ -1380,11 +1378,11 @@ class SimpleAI:
             elif speed > 2.0:
                 brake = True
 
-        can_evade_shoot = self.mode == "EVADE" and (close_count >= 3 or dist < 200)
+        can_evade_shoot = self.mode == self.MODE_EVADE and (close_count >= 3 or dist < 200)
         if (
             dist < 560
             and self.cooldown <= 0
-            and ((self.mode != "EVADE" and abs(diff) < 8) or (can_evade_shoot and abs(aim_diff) < 10))
+            and ((self.mode != self.MODE_EVADE and abs(diff) < 8) or (can_evade_shoot and abs(aim_diff) < 10))
         ):
             shoot = True
             self.cooldown = 10 if can_evade_shoot else 12
@@ -1561,9 +1559,10 @@ def main():
                 BigRock(screen, rocks)
 
         Score.draw(screen, rocks)
+        pilot_status = "AUTO " + ai_state if ai_mode else ("MANUAL" if ship is not None else "DESTROYED")
         textBlit(
             screen,
-            "AI: " + ai_state,
+            "Pilot: " + pilot_status,
             "Arial",
             30,
             BLUE,
